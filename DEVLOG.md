@@ -4,7 +4,6 @@
 ---
 
 # ALLOCATE — Engineering State Log
-*Phase 1–3 · Principal: Andrew Zheng · Architect: Antigravity*
 
 ---
 
