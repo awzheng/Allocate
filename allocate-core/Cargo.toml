@@ -1,0 +1,29 @@
+[package]
+name        = "allocate-core"
+version     = "0.1.0"
+edition     = "2021"
+description = "Allocate – hardware-aware watchdog daemon for macOS"
+license     = "MIT"
+
+[[bin]]
+name = "allocate-core"
+path = "src/main.rs"
+
+# ── Dependencies ──────────────────────────────────────────────────────────────
+[dependencies]
+# ObjC2: safe, zero-cost Rust bindings to the Objective-C runtime.
+# Used to call NSWorkspace (AppKit) for frontmost-application detection
+# and NSNotificationCenter for event-driven app-switch observation.
+objc2             = "0.5"
+objc2-foundation  = { version = "0.2", features = ["NSString", "NSNotification"] }
+objc2-app-kit     = { version = "0.2", features = ["NSWorkspace", "NSRunningApplication"] }
+
+# block2: Rust ↔ Objective-C block (closure) interop, pairs with objc2 0.5.
+# Used to pass a Rust closure as an ObjC block to addObserverForName:usingBlock:.
+block2 = "0.5"
+
+
+# libc: canonical C-type aliases (c_int, c_void, pid_t …) used in proc_pidinfo FFI.
+libc = "0.2"
+
+# Release profile is defined at the workspace root (Cargo.toml) per Cargo rules.

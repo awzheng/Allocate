@@ -1,0 +1,11 @@
+[workspace]
+members  = ["allocate-core"]
+resolver = "2"
+
+# ── Workspace-wide release profile ───────────────────────────────────────────
+# Cargo only reads [profile.*] from the workspace root, not from member crates.
+[profile.release]
+opt-level     = 3    # maximum code-gen optimisation
+lto           = true # whole-program dead-code elimination across crates
+codegen-units = 1    # single codegen unit: best IR for LTO
+strip         = true # strip debug symbols → smaller binary, lower mmap pressure
