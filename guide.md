@@ -10,7 +10,7 @@
 
 ## What Allocate Does
 
-Every time you switch apps, `allocate-core` wakes up **instantly** — no 2-second polling lag — and prints a hardware telemetry table to the terminal:
+Every time you switch apps, `allocate-core` wakes up **instantly** and prints a hardware telemetry table to the terminal:
 
 ```
 ┌──────────────────────────────────────────────────────────
