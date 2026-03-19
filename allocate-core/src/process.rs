@@ -329,7 +329,7 @@ mod tests {
     fn test_compute_top_cpu_empty_on_zero_elapsed() {
         let s1 = CpuSnapshot::new();
         let s2 = CpuSnapshot::new();
-        let result = compute_top_cpu(&s1, &s2, 0, None, 3);
+        let result = compute_top_cpu(&s1, &s2, 0, None, 20);
         assert!(result.is_empty());
     }
 }

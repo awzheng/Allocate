@@ -40,7 +40,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         // .nonactivatingPanel allows clicking the HUD without stealing OS focus.
         // .titled is required for .fullSizeContentView / dragging by background.
         panel = NSPanel(
-            contentRect: NSRect(x: 0, y: 0, width: 420, height: 520),
+            contentRect: NSRect(x: 0, y: 0, width: 420, height: 620),
             styleMask: [
                 .titled, 
                 .closable,

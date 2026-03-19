@@ -28,7 +28,7 @@ struct ContentView: View {
         }
         .background(Color(NSColor.windowBackgroundColor))
         .frame(width: 480)
-        .frame(minHeight: 180, maxHeight: 560)
+        .frame(minHeight: 180, maxHeight: 620)
     }
 }
 

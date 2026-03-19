@@ -39,7 +39,7 @@ use process::{compute_top_cpu, format_ram, take_snapshot, CpuSnapshot, ProcessMe
 const CPU_SAMPLE_WINDOW: Duration = Duration::from_millis(500);
 
 /// How many background hogs to surface per report.
-const TOP_N: usize = 3;
+const TOP_N: usize = 20;
 
 /// Separator line for the brutalist table borders.
 const SEP: &str = "──────────────────────────────────────────────────────────";
