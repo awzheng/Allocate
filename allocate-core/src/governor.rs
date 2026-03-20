@@ -51,35 +51,22 @@ impl Governor {
 
     /// Main evaluation tick — call once per worker-loop iteration.
     ///
-    /// `hogs` is the slice returned by `compute_top_cpu` for the current cycle.
-    /// The governor mutates `self.suspended` and prints a `[GOV]` line for every
-    /// state transition. No other side-effects.
+    /// Frozen PIDs stay frozen indefinitely; only `release_all()` can resume
+    /// them. This avoids the oscillation loop where SIGSTOP drives CPU to 0%,
+    /// causing the governor to immediately SIGCONT on the next cycle.
     pub fn evaluate(&mut self, hogs: &[ProcessMetrics]) {
-        // 1. Build the set of allowed PIDs that are currently above the threshold.
-        let hot: HashSet<i32> = hogs
+        // Collect allowed PIDs currently above the CPU threshold.
+        let hot: Vec<i32> = hogs
             .iter()
             .filter(|m| is_target(&m.name) && m.cpu_pct >= FREEZE_THRESHOLD_PCT)
             .map(|m| m.pid)
             .collect();
 
-        // 2. Resume any PID we previously froze but that is no longer hot.
-        let to_resume: Vec<i32> = self
-            .suspended
-            .iter()
-            .copied()
-            .filter(|pid| !hot.contains(pid))
-            .collect();
-
-        for pid in to_resume {
-            send_signal(pid, libc::SIGCONT, "SIGCONT (resume)");
-            self.suspended.remove(&pid);
-        }
-
-        // 3. Freeze any newly-hot PID that is not already suspended.
-        for pid in &hot {
-            if !self.suspended.contains(pid) {
-                send_signal(*pid, libc::SIGSTOP, "SIGSTOP (freeze)");
-                self.suspended.insert(*pid);
+        // Freeze any newly-hot PID not already suspended.
+        for pid in hot {
+            if !self.suspended.contains(&pid) {
+                send_signal(pid, libc::SIGSTOP, "SIGSTOP (freeze)");
+                self.suspended.insert(pid);
             }
         }
     }

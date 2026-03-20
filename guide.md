@@ -100,29 +100,40 @@ cargo --version   # confirms cargo is accessible
 
 ---
 
-## Running the Daemon
+## Testing the Active Governor (Dummy Hog)
 
-### Mode 1: Terminal Development (no XPC) — the normal dev loop
+### Step 1 (The Target)
+Open **Terminal A** and launch the intentional CPU hog:
 
 ```bash
 cd /Users/andrewzheng/Allocate
-cargo build
-./target/debug/allocate-core
+cargo run -p dummy-hog
 ```
 
-The daemon starts, prints the banner, then waits. **Switch to any other app** — the
-brutalist table appears instantly. XPC is automatically bypassed:
+*This safely spikes CPU usage to roughly 100% on a dedicated background process without destabilizing the system.*
+
+### Step 2 (The Governor)
+Open **Terminal B** and run the core daemon with root privileges:
+
+```bash
+cd /Users/andrewzheng/Allocate
+sudo cargo run -p allocate-core
+```
+
+> **Why `sudo`?** The governor requires root authority to issue `SIGSTOP` and `SIGCONT` signals to other processes, as well as to reliably read full `proc_pidinfo` telemetry across the system.
+
+### Step 3 (The Trigger)
+The daemon is now armed. **Switch focus to any other app** (e.g., click on Chrome or the Finder desktop). 
+
+This instantly triggers the background worker loop. In **Terminal B**, the brutalist telemetry table will appear, followed immediately by the active mitigation action:
 
 ```
-[DEBUG] XPC bypassed for terminal dev (set ALLOCATE_XPC_ENABLE=1 to enable)
+[GOV] SIGSTOP (freeze) → pid <N>
 ```
 
-> **Why does XPC get bypassed?** `xpc_connection_create_mach_service(LISTENER)` does
-> **not** return null when the service is unprovisioned — it raises SIGTRAP and kills
-> the process immediately (BUG-005). The `ALLOCATE_XPC_ENABLE` guard skips the call
-> entirely when running directly from a terminal without a launchd session.
+*The dummy-hog process is now suspended indefinitely via a kernel-level freeze. If you check Activity Monitor, its status will read "Stopped".*
 
-Exit with **Ctrl+C**.
+*(To exit, press **Ctrl+C** in Terminal B. If dummy-hog is left frozen, you can manually resume it with `kill -CONT <pid>`).*
 
 ### Mode 2: LaunchAgent + XPC (production / allocate-ui integration)
 
@@ -157,7 +168,7 @@ rm ~/Library/LaunchAgents/com.andrewzheng.allocate.daemon.plist
 
 ---
 
-## Phase 6: Building allocate-ui in Xcode
+## Building allocate-ui in Xcode
 
 ### Step 1 — Create the Xcode project
 
