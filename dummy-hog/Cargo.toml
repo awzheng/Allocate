@@ -1,0 +1,12 @@
+[package]
+name    = "dummy-hog"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "dummy-hog"
+path = "src/main.rs"
+
+[dependencies]
+# Cross-platform Ctrl-C (SIGINT) handler
+ctrlc = { version = "3", features = ["termination"] }

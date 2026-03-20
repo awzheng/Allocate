@@ -102,6 +102,7 @@ pub type CpuSnapshot = HashMap<i32, (String, u64, u64, i32)>;
 /// Fully-expanded per-process metrics returned by compute_top_cpu.
 #[derive(Debug, Clone)]
 pub struct ProcessMetrics {
+    pub pid:            i32,
     pub name:           String,
     pub cpu_pct:        f64,
     pub resident_bytes: u64,
@@ -282,6 +283,7 @@ pub fn compute_top_cpu(
 
             if pct >= 0.1 {
                 Some(ProcessMetrics {
+                    pid:            pid,
                     name:           name.clone(),
                     cpu_pct:        pct,
                     resident_bytes: *resident_bytes,

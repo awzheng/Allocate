@@ -18,6 +18,7 @@
 
 mod battery;
 mod frontmost;
+mod governor;
 mod ipc;
 mod process;
 
@@ -30,6 +31,7 @@ use objc2::runtime::AnyObject;
 
 use battery::{get_battery_state, BatteryState};
 use frontmost::{AppSwitchSignal, ForegroundApp};
+use governor::Governor;
 use ipc::IpcBroadcaster;
 use process::{compute_top_cpu, format_ram, take_snapshot, CpuSnapshot, ProcessMetrics};
 
@@ -98,6 +100,8 @@ fn main() {
 // ── Worker thread ─────────────────────────────────────────────────────────────
 
 fn worker_loop(rx: mpsc::Receiver<AppSwitchSignal>, broadcaster: IpcBroadcaster) {
+    let mut governor = Governor::new();
+
     // Block on the channel. Wakes the instant the OS fires the app-switch
     // notification — no polling sleep. recv() returns Err when all senders drop.
     while let Ok(signal) = rx.recv() {
@@ -112,6 +116,9 @@ fn worker_loop(rx: mpsc::Receiver<AppSwitchSignal>, broadcaster: IpcBroadcaster)
 
         let hogs: Vec<ProcessMetrics> =
             compute_top_cpu(&snap1, &snap2, elapsed_ns, Some(fg.pid), TOP_N);
+
+        // ── Active mitigation: freeze / resume dummy-hog as needed ────────────
+        governor.evaluate(&hogs);
 
         // IOPowerSources: fast synchronous IOKit call (≤10 ms). None on desktops.
         let batt: Option<BatteryState> = get_battery_state();
