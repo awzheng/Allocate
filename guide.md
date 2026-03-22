@@ -100,7 +100,9 @@ cargo --version   # confirms cargo is accessible
 
 ---
 
-## Testing the Active Governor (Dummy Hog)
+## Section 1: Terminal MVP Testing (dummy-hog)
+
+This workflow tests the governor in a safe, controlled terminal environment using our synthetic load generator.
 
 ### Step 1 (The Target)
 Open **Terminal A** and launch the intentional CPU hog:
@@ -110,7 +112,7 @@ cd /Users/andrewzheng/Allocate
 cargo run -p dummy-hog
 ```
 
-*This safely spikes CPU usage to roughly 100% on a dedicated background process without destabilizing the system.*
+*This safely spins up threads to calculate prime numbers, spiking its CPU usage to >100% without destabilizing the system.*
 
 ### Step 2 (The Governor)
 Open **Terminal B** and run the core daemon with root privileges:
@@ -120,20 +122,78 @@ cd /Users/andrewzheng/Allocate
 sudo cargo run -p allocate-core
 ```
 
-> **Why `sudo`?** The governor requires root authority to issue `SIGSTOP` and `SIGCONT` signals to other processes, as well as to reliably read full `proc_pidinfo` telemetry across the system.
+> **Why `sudo`?** The governor needs root authority to issue `SIGSTOP` / `SIGCONT` signals to other processes, and to read `proc_pidinfo` telemetry globally.
 
 ### Step 3 (The Trigger)
-The daemon is now armed. **Switch focus to any other app** (e.g., click on Chrome or the Finder desktop). 
+The daemon is armed. **Switch focus to any other app** (e.g., click on Chrome or the Finder desktop).
 
-This instantly triggers the background worker loop. In **Terminal B**, the brutalist telemetry table will appear, followed immediately by the active mitigation action:
+This instantly triggers the background worker loop. In **Terminal B**, the brutalist telemetry table will appear, followed immediately by:
 
 ```
 [GOV] SIGSTOP (freeze) → pid <N>
 ```
 
-*The dummy-hog process is now suspended indefinitely via a kernel-level freeze. If you check Activity Monitor, its status will read "Stopped".*
+*The dummy-hog process is now suspended indefinitely via a kernel-level freeze. Activity Monitor will show its status as "Stopped".*
 
-*(To exit, press **Ctrl+C** in Terminal B. If dummy-hog is left frozen, you can manually resume it with `kill -CONT <pid>`).*
+To clean up safely, press **Ctrl+C** in Terminal B. The graceful shutdown hook will automatically issue `SIGCONT` to dummy-hog before exiting.
+
+---
+
+## Section 2: Production Live Fire (Minecraft)
+
+This workflow tests the fully dynamic targeting matrix (`uid >= 500` + CPU threshold + `IGNORE_NAMES` deny-list) on a real-world application, while running as a true background launchd daemon.
+
+### Step 1 (Compile & Install)
+Compile the release binary and install the LaunchAgent:
+
+```bash
+cd /Users/andrewzheng/Allocate
+cargo build --release -p allocate-core
+chmod +x scripts/install_agent.sh
+./scripts/install_agent.sh
+```
+
+### Step 2 (The Target)
+Launch your target user-space application (e.g., **Minecraft** or a heavy Docker container build) and force it to do heavy work to push its CPU past the 5.0% threshold.
+
+### Step 3 (The Trigger)
+While the app is under heavy load, **Command-Tab (⌘-Tab)** to any other application. 
+
+The background `allocate-core` daemon will immediately catch the app-switch event, snapshot the CPU, see the game exceeding 5.0%, and issue `SIGCONT` to freeze it instantly. You will notice the game application freeze entirely (audio stops, UI pinwheels).
+
+### Step 4 (Verify)
+Check the daemon logs to verify the mitigation fired correctly on the target PID:
+
+```bash
+tail -n 20 /tmp/allocate-daemon.log
+```
+
+---
+
+## Section 3: Emergency Recovery
+
+If a process is left frozen (e.g. if the daemon was killed via `SIGKILL` before the graceful shutdown could execute, or if an environment overlap blinded the daemon to the frozen process), use these recovery methods.
+
+### Primary: Stateless Defibrillator
+`allocate-core` includes a dedicated stateless recovery mode that bypasses all daemon logic and broadcasts a wake-up signal to every eligible user-space process on the system:
+
+```bash
+cd /Users/andrewzheng/Allocate
+sudo ./target/release/allocate-core --recover
+```
+
+Expected output:
+```
+[RECOVERY] Woke up java (PID 45432)
+[RECOVERY] Done — sent SIGCONT to 1 process(es).
+```
+
+### Fallback: Raw Unix Signal
+If the targeting matrix itself is blocking the recovery, you can manually unfreeze a specific process using standard POSIX signals. First, find the PID in Activity Monitor or via `ps`, then run:
+
+```bash
+sudo kill -CONT <pid>
+```
 
 ### Mode 2: LaunchAgent + XPC (production / allocate-ui integration)
 
