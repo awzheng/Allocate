@@ -23,6 +23,7 @@ mod ipc;
 mod process;
 
 use std::sync::mpsc;
+use std::sync::{Arc, atomic::{AtomicBool, Ordering}};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -31,7 +32,7 @@ use objc2::runtime::AnyObject;
 
 use battery::{get_battery_state, BatteryState};
 use frontmost::{AppSwitchSignal, ForegroundApp};
-use governor::Governor;
+use governor::{Governor, run_recovery};
 use ipc::IpcBroadcaster;
 use process::{compute_top_cpu, format_ram, take_snapshot, CpuSnapshot, ProcessMetrics};
 
@@ -49,6 +50,18 @@ const SEP: &str = "────────────────────�
 // ── Entry point ───────────────────────────────────────────────────────────────
 
 fn main() {
+    // ── --recover: stateless escape hatch ──────────────────────────────────────
+    //
+    // Runs before NSApplication / XPC / signal setup so it executes cleanly
+    // even when the daemon is not registered with launchd.  SIGCONT on a
+    // running process is a POSIX no-op, so broadcasting to all eligible PIDs
+    // is safe.
+    if std::env::args().any(|a| a == "--recover") {
+        let n = run_recovery();
+        println!("[RECOVERY] Done — sent SIGCONT to {} process(es).", n);
+        std::process::exit(0);
+    }
+
     // ── Step 1: Open a Window Server session ─────────────────────────────────
     //
     // NSApplication::sharedApplication() registers the process with the macOS
@@ -61,34 +74,56 @@ fn main() {
 
     print_banner();
 
-    // ── Step 2: Start the XPC listener (GCD thread pool — no Rust thread) ────
+    // ── Step 2: Arm graceful-shutdown signal handlers ─────────────────────────
+    //
+    // signal_hook::flag::register atomically sets the AtomicBool on SIGINT /
+    // SIGTERM. This is async-signal-safe: the only operation inside the signal
+    // handler is a single atomic store (SeqCst), which is async-signal-safe on
+    // all POSIX platforms.
+    //
+    // The flag is cloned into the worker thread; main holds the other Arc so
+    // the bool outlives both threads.
+    let shutdown = Arc::new(AtomicBool::new(false));
+    signal_hook::flag::register(signal_hook::consts::SIGINT,  Arc::clone(&shutdown))
+        .expect("Failed to register SIGINT handler");
+    signal_hook::flag::register(signal_hook::consts::SIGTERM, Arc::clone(&shutdown))
+        .expect("Failed to register SIGTERM handler");
+
+    // ── Step 3: Start the XPC listener (GCD thread pool — no Rust thread) ────
     //
     // Registers a named Mach service listener. Returns an IpcBroadcaster that
     // the worker thread uses to push table strings to connected allocate-ui
     // clients. Degrades to a no-op if the launchd plist is not installed.
     let broadcaster = ipc::start_listener();
 
-    // ── Step 3: Create the app-switch mpsc channel ────────────────────────────
+    // ── Step 4: Create the app-switch mpsc channel ────────────────────────────
     //
     // tx → moved into the ObjC notification block (fires on main thread).
     // rx → held by the worker thread, wakes on every app switch.
     let (tx, rx) = mpsc::channel::<AppSwitchSignal>();
 
-    // ── Step 4: Register the NSWorkspace event-driven observer ───────────────
+    // ── Step 5: Register the NSWorkspace event-driven observer ───────────────
     //
     // Passes tx into the ObjC block ('static, moved). _observer must live for
     // the process lifetime — dropping it deregisters the observer.
     let _observer = frontmost::register_app_switch_observer(tx);
 
-    // ── Step 5: Spawn the worker thread ──────────────────────────────────────
-    thread::spawn(move || worker_loop(rx, broadcaster));
+    // ── Step 6: Spawn the worker thread ──────────────────────────────────────
+    let shutdown_worker = Arc::clone(&shutdown);
+    thread::spawn(move || worker_loop(rx, broadcaster, shutdown_worker));
 
-    // ── Step 6: Run the main NSRunLoop forever ────────────────────────────────
+    // ── Step 7: Run the main NSRunLoop forever ────────────────────────────────
     //
     // The NSRunLoop is the sole event pump for AppKit on this process. It must
     // run unblocked on the main thread. Every app switch causes the Window Server
     // to post a Mach message here; the run loop drains it and fires the observer
-    // block, which calls tx.send(). Ctrl+C exits via default SIGINT.
+    // block, which calls tx.send().
+    //
+    // On SIGINT / SIGTERM the shutdown flag is set; the worker loop detects it,
+    // calls release_all(), and exits. The NSRunLoop keeps running until the OS
+    // terminates the process after the signal — this is the correct macOS daemon
+    // lifecycle (launchd will SIGKILL if we do not exit promptly, but release_all
+    // will have already issued SIGCONT to all suspended PIDs).
     //
     // SAFETY: NSRunLoop is always registered once Foundation is linked.
     unsafe {
@@ -99,12 +134,26 @@ fn main() {
 
 // ── Worker thread ─────────────────────────────────────────────────────────────
 
-fn worker_loop(rx: mpsc::Receiver<AppSwitchSignal>, broadcaster: IpcBroadcaster) {
+fn worker_loop(
+    rx:         mpsc::Receiver<AppSwitchSignal>,
+    broadcaster: IpcBroadcaster,
+    shutdown:   Arc<AtomicBool>,
+) {
     let mut governor = Governor::new();
 
     // Block on the channel. Wakes the instant the OS fires the app-switch
     // notification — no polling sleep. recv() returns Err when all senders drop.
     while let Ok(signal) = rx.recv() {
+        // ── Graceful shutdown check ───────────────────────────────────────────
+        // Checked at the top of each cycle so we always release suspended PIDs
+        // before exiting, regardless of which signal arrived.
+        if shutdown.load(Ordering::Relaxed) {
+            println!("[SHUTDOWN] Signal received — releasing all suspended PIDs…");
+            governor.release_all();
+            println!("[SHUTDOWN] Clean exit.");
+            std::process::exit(0);
+        }
+
         let fg = ForegroundApp { name: signal.name, pid: signal.pid };
 
         // ── Two proc_pidinfo snapshots across a 500 ms CPU sampling window ────

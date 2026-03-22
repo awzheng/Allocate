@@ -3,32 +3,60 @@
 // Phase 7 — Active Mitigation Governor
 //
 // Evaluates the current list of background CPU hogs and issues SIGSTOP /
-// SIGCONT to maintain a hardcoded allowlist of target processes.
+// SIGCONT to suspend runaway user-space processes while protecting critical
+// system UI daemons.
 //
 // ── Safety contract ───────────────────────────────────────────────────────────
 //
-//  1. TARGET_NAMES is the ONLY processes this module will ever signal.
-//     Any PID whose name is not in that set is silently skipped.
+//  Rule 1: Only processes owned by a standard user (uid >= 500) are eligible.
+//          Root / system processes (UID 0–499) are unconditionally skipped.
 //
-//  2. SIGSTOP is reversible — we always SIGCONT before the governor drops.
-//     Call Governor::release_all() on daemon shutdown for a clean teardown.
+//  Rule 2: IGNORE_NAMES is a hardcoded, strict deny-list of critical user-space
+//          UI processes that must never be frozen. Any process whose name
+//          appears in this list is unconditionally skipped regardless of uid.
 //
-//  3. We call libc::kill() directly. On macOS this is a standard BSD syscall;
-//     it does not trigger undefined behaviour as long as the PID is valid and
-//     the process still exists. ESRCH (no such process) is handled gracefully.
+//  Rule 3: A process must exceed FREEZE_THRESHOLD_PCT CPU to be frozen.
+//
+//  Rule 4: SIGSTOP is reversible — we always SIGCONT before the governor drops.
+//          Call Governor::release_all() on daemon shutdown for a clean teardown.
+//
+//  Rule 6: run_recovery() is a stateless escape hatch. It issues SIGCONT to
+//          every user-space non-ignored PID regardless of internal HashSet state.
+//          SIGCONT on a running process is a POSIX no-op — safe to broadcast.
+//
+//  Rule 5: We call libc::kill() directly. On macOS this is a standard BSD
+//          syscall; it does not trigger undefined behaviour as long as the PID
+//          is valid and the process still exists. ESRCH (no such process) is
+//          handled gracefully.
 
 use std::collections::HashSet;
 
-use crate::process::ProcessMetrics;
+use crate::process::{take_snapshot, ProcessMetrics};
 
 // ── Tuning constants ──────────────────────────────────────────────────────────
 
-/// CPU threshold (percent) above which an allowed process is frozen.
+/// CPU threshold (percent) above which an eligible process is frozen.
 const FREEZE_THRESHOLD_PCT: f64 = 5.0;
 
-/// Names the governor is authorised to signal.
-/// All other processes are implicitly ignored.
-const TARGET_NAMES: &[&str] = &["dummy-hog"] as &[&str];
+/// Minimum UID considered a standard user-space application.
+/// UIDs 0–499 are reserved for root and system accounts on macOS.
+const MIN_USER_UID: u32 = 500;
+
+/// Critical user-space UI processes that must never receive SIGSTOP.
+///
+/// These run in user space (uid typically 0 or 88) but are essential to the
+/// macOS GUI session. Freezing any of them would make the desktop unusable.
+static IGNORE_NAMES: &[&str] = &[
+    "WindowServer",       // Quartz Compositor — kills display if stopped
+    "Dock",               // Dock / Mission Control
+    "Finder",             // Default file manager
+    "loginwindow",        // Session manager / login screen
+    "coreaudiod",         // Core Audio daemon — all system audio routes through this
+    "SystemUIServer",     // Menu-bar extras host
+    "NotificationCenter", // macOS notification delivery
+    "Spotlight",          // Spotlight search
+    "launchd",            // PID 1 — absolutely never touch
+];
 
 // ── Governor ──────────────────────────────────────────────────────────────────
 
@@ -55,10 +83,10 @@ impl Governor {
     /// them. This avoids the oscillation loop where SIGSTOP drives CPU to 0%,
     /// causing the governor to immediately SIGCONT on the next cycle.
     pub fn evaluate(&mut self, hogs: &[ProcessMetrics]) {
-        // Collect allowed PIDs currently above the CPU threshold.
+        // Collect eligible PIDs currently above the CPU threshold.
         let hot: Vec<i32> = hogs
             .iter()
-            .filter(|m| is_target(&m.name) && m.cpu_pct >= FREEZE_THRESHOLD_PCT)
+            .filter(|m| should_freeze(m))
             .map(|m| m.pid)
             .collect();
 
@@ -73,7 +101,6 @@ impl Governor {
 
     /// Resume every suspended PID. Call on clean daemon shutdown so no
     /// process is left stranded in the stopped state.
-    #[allow(dead_code)]
     pub fn release_all(&mut self) {
         for pid in self.suspended.drain() {
             send_signal(pid, libc::SIGCONT, "SIGCONT (release-all)");
@@ -81,12 +108,59 @@ impl Governor {
     }
 }
 
+// ── Stateless recovery ───────────────────────────────────────────────────────
+
+/// Scans all running processes and issues SIGCONT to every user-space process
+/// that the governor is permitted to target (uid ≥ MIN_USER_UID, not in
+/// IGNORE_NAMES). Designed for the `--recover` CLI mode; does not require or
+/// modify any Governor instance.
+///
+/// Returns the number of PIDs that received SIGCONT (including those already
+/// running — POSIX guarantees SIGCONT on a non-stopped process is a no-op).
+pub fn run_recovery() -> usize {
+    let snap = take_snapshot();
+    let mut count = 0;
+
+    for (&pid, (name, _, _, _, uid)) in &snap {
+        if *uid < MIN_USER_UID {
+            continue;
+        }
+        if IGNORE_NAMES.iter().any(|&blocked| name == blocked) {
+            continue;
+        }
+        // SAFETY: kill(2) / SIGCONT — identical safety justification as send_signal.
+        let ret = unsafe { libc::kill(pid, libc::SIGCONT) };
+        if ret == 0 {
+            println!("[RECOVERY] Woke up {} (PID {})", name, pid);
+            count += 1;
+        } else {
+            let err = std::io::Error::last_os_error();
+            if err.raw_os_error() != Some(libc::ESRCH) {
+                eprintln!("[RECOVERY] SIGCONT → pid {} FAILED: {}", pid, err);
+            }
+        }
+    }
+
+    count
+}
+
 // ── Private helpers ───────────────────────────────────────────────────────────
 
-/// Returns true iff `name` is in the authorised target list.
+/// Returns true iff this process is a valid freeze candidate.
+///
+/// A process is frozen only when ALL of the following hold:
+///   1. uid >= MIN_USER_UID   (not a root/system process)
+///   2. name not in IGNORE_NAMES   (not a protected UI daemon)
+///   3. cpu_pct >= FREEZE_THRESHOLD_PCT   (actually hogging CPU)
 #[inline]
-fn is_target(name: &str) -> bool {
-    TARGET_NAMES.iter().any(|&t| name == t)
+fn should_freeze(m: &ProcessMetrics) -> bool {
+    if m.uid < MIN_USER_UID {
+        return false;
+    }
+    if IGNORE_NAMES.iter().any(|&blocked| m.name == blocked) {
+        return false;
+    }
+    m.cpu_pct >= FREEZE_THRESHOLD_PCT
 }
 
 /// Sends `sig` to `pid` via libc::kill and logs the outcome.

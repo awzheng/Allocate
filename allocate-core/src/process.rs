@@ -93,17 +93,19 @@ struct ProcBsdShortInfo {
 
 // ── Public types ──────────────────────────────────────────────────────────────
 
-/// Point-in-time snapshot: PID → (name, cumulative_cpu_ns, resident_bytes, threadnum).
+/// Point-in-time snapshot: PID → (name, cumulative_cpu_ns, resident_bytes, threadnum, uid).
 ///
 /// Two fields added in Phase 3 (pti_resident_size, pti_threadnum) come from the
 /// same single proc_pidinfo call already used for cpu_ns — zero extra syscalls.
-pub type CpuSnapshot = HashMap<i32, (String, u64, u64, i32)>;
+/// uid (Phase 7) requires one additional PROC_PIDTBSDSHORTINFO call per PID.
+pub type CpuSnapshot = HashMap<i32, (String, u64, u64, i32, u32)>;
 
 /// Fully-expanded per-process metrics returned by compute_top_cpu.
 #[derive(Debug, Clone)]
 pub struct ProcessMetrics {
     pub pid:            i32,
     pub name:           String,
+    pub uid:            u32,
     pub cpu_pct:        f64,
     pub resident_bytes: u64,
     pub threadnum:      i32,
@@ -201,6 +203,32 @@ fn read_proc_name(pid: i32) -> String {
     format!("<{}>", pid)
 }
 
+/// Reads the effective UID for `pid` via PROC_PIDTBSDSHORTINFO.
+///
+/// Returns 0 (root/unknown) if the call fails (EPERM, ESRCH, or process gone).
+/// SAFETY: assume_init() is only called when ret >= expected.
+fn read_bsd_uid(pid: i32) -> u32 {
+    let mut info = mem::MaybeUninit::<ProcBsdShortInfo>::uninit();
+    let expected = mem::size_of::<ProcBsdShortInfo>() as c_int;
+
+    let ret = unsafe {
+        proc_pidinfo(
+            pid,
+            PROC_PIDTBSDSHORTINFO,
+            0,
+            info.as_mut_ptr().cast::<libc::c_void>(),
+            expected,
+        )
+    };
+
+    if ret >= expected {
+        // SAFETY: ret >= expected guarantees every field was written by the kernel.
+        unsafe { info.assume_init() }.pbsi_uid
+    } else {
+        0
+    }
+}
+
 /// Reads cpu_ns, resident_bytes, and threadnum for `pid` in a single syscall.
 ///
 /// Returns None on EPERM or ESRCH (root-owned process or process gone).
@@ -246,7 +274,8 @@ pub fn take_snapshot() -> CpuSnapshot {
     for pid in pids {
         if let Some((cpu_ns, resident_bytes, threadnum)) = read_task_info(pid) {
             let name = read_proc_name(pid);
-            snap.insert(pid, (name, cpu_ns, resident_bytes, threadnum));
+            let uid  = read_bsd_uid(pid);
+            snap.insert(pid, (name, cpu_ns, resident_bytes, threadnum, uid));
         }
     }
 
@@ -272,12 +301,12 @@ pub fn compute_top_cpu(
 
     let mut metrics: Vec<ProcessMetrics> = s2
         .iter()
-        .filter_map(|(&pid, (name, cpu2, resident_bytes, threadnum))| {
+        .filter_map(|(&pid, (name, cpu2, resident_bytes, threadnum, uid))| {
             if Some(pid) == exclude_pid {
                 return None;
             }
 
-            let cpu1 = s1.get(&pid).map_or(0u64, |(_, c, _, _)| *c);
+            let cpu1 = s1.get(&pid).map_or(0u64, |(_, c, _, _, _)| *c);
             let delta = cpu2.saturating_sub(cpu1);
             let pct = (delta as f64 / elapsed_ns as f64) * 100.0;
 
@@ -285,6 +314,7 @@ pub fn compute_top_cpu(
                 Some(ProcessMetrics {
                     pid:            pid,
                     name:           name.clone(),
+                    uid:            *uid,
                     cpu_pct:        pct,
                     resident_bytes: *resident_bytes,
                     threadnum:      *threadnum,

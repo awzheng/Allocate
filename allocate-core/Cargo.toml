@@ -26,4 +26,9 @@ block2 = "0.5"
 # libc: canonical C-type aliases (c_int, c_void, pid_t …) used in proc_pidinfo FFI.
 libc = "0.2"
 
+# signal-hook: safe POSIX signal registration for graceful shutdown.
+# Only the `flag` sub-feature is used: registers SIGINT/SIGTERM to atomically
+# set an Arc<AtomicBool>, which the worker thread polls each cycle.
+signal-hook = "0.3"
+
 # Release profile is defined at the workspace root (Cargo.toml) per Cargo rules.
