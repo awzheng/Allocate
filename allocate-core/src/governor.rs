@@ -36,7 +36,7 @@ use crate::process::{take_snapshot, ProcessMetrics};
 // ── Tuning constants ──────────────────────────────────────────────────────────
 
 /// CPU threshold (percent) above which an eligible process is frozen.
-const FREEZE_THRESHOLD_PCT: f64 = 5.0;
+const FREEZE_THRESHOLD_PCT: f64 = 10.0;
 
 /// Minimum UID considered a standard user-space application.
 /// UIDs 0–499 are reserved for root and system accounts on macOS.
