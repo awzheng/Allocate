@@ -1,12 +1,12 @@
 // ContentView.swift
-// allocate-ui — Phase 6: Native Activity Monitor UI
+// allocate-ui — Phase 9.2: Two-way XPC, Hysteresis Sliders, UI Polish
 //
-// Apple HIG compliance:
-//   • System background colors (.windowBackground) — auto Light/Dark
-//   • SF Pro .body for labels; .monospacedDigit() on numerics only
-//   • SwiftUI Table with native column headers and sorting
-//   • SF Symbols for iconography
-//   • Semantic colors only — no hardcoded hex
+// Changes from Phase 9.1:
+//   • Window is now fully resizable (flexible frame constraints)
+//   • "JAILED" badge renamed to "THROTTLED"
+//   • Active foreground app pinned as first table row with "IN FOCUS" badge
+//   • ConfigPanel added at bottom: slider + text-field pairs for both thresholds
+//   • Config changes send XPC messages back to the daemon in real time
 
 import SwiftUI
 
@@ -25,10 +25,14 @@ struct ContentView: View {
             } else {
                 EmptyStateView(isConnected: client.isConnected)
             }
+
+            Divider()
+            ConfigPanel(client: client)
         }
         .background(Color(NSColor.windowBackgroundColor))
-        .frame(width: 480)
-        .frame(minHeight: 180, maxHeight: 620)
+        // Flexible sizing — NSPanel handles actual window constraints.
+        .frame(minWidth: 440, idealWidth: 560, maxWidth: .infinity)
+        .frame(minHeight: 300, idealHeight: 560, maxHeight: .infinity)
     }
 }
 
@@ -39,7 +43,6 @@ private struct HeaderBar: View {
 
     var body: some View {
         HStack(spacing: 10) {
-            // App icon + name
             Image(systemName: "gauge.with.dots.needle.67percent")
                 .font(.system(size: 14, weight: .semibold))
                 .foregroundStyle(.secondary)
@@ -76,30 +79,44 @@ private struct TelemetryTable: View {
     let state: TelemetryState
     @State private var sortOrder = [KeyPathComparator(\ProcessMetrics.id)]
 
-    var sortedProcesses: [ProcessMetrics] {
-        state.processes.sorted(using: sortOrder)
+    /// The frontmost row is pinned first; background hogs follow sorted by
+    /// the user's chosen column.  The frontmost row carries real CPU/RAM/threads
+    /// data from the daemon — no synthetic placeholder needed.
+    var displayRows: [ProcessMetrics] {
+        let fg   = state.processes.first { $0.isForeground }
+        let hogs = state.processes.filter { !$0.isForeground }.sorted(using: sortOrder)
+        guard let fg else { return hogs }
+        return [fg] + hogs
     }
 
     var body: some View {
-        Table(sortedProcesses, sortOrder: $sortOrder) {
+        Table(displayRows, sortOrder: $sortOrder) {
             TableColumn("#", value: \.id) { row in
-                Text("\(row.id)")
+                Text(row.isForeground ? "▶" : "\(row.id)")
                     .font(.body.monospacedDigit())
-                    .foregroundStyle(.secondary)
+                    .foregroundStyle(row.isForeground ? Color.blue : Color.secondary)
             }
             .width(24)
 
             TableColumn("Process", value: \.name) { row in
-                Text(row.name)
-                    .font(.body)
-                    .lineLimit(1)
+                HStack(spacing: 6) {
+                    Text(row.name)
+                        .font(.body)
+                        .lineLimit(1)
+                        .foregroundStyle(nameColor(for: row))
+                    if row.isForeground {
+                        badge("IN FOCUS", color: .blue)
+                    } else if row.isThrottled {
+                        badge("THROTTLED", color: .orange)
+                    }
+                }
             }
-            .width(min: 120, ideal: 160)
+            .width(min: 120, ideal: 180)
 
             TableColumn("CPU", value: \.cpu) { row in
                 Text(row.cpu)
                     .font(.body.monospacedDigit())
-                    .foregroundStyle(cpuColor(row.cpu))
+                    .foregroundStyle(row.isForeground ? Color.secondary : cpuColor(row.cpu))
                     .frame(maxWidth: .infinity, alignment: .trailing)
             }
             .width(64)
@@ -107,6 +124,7 @@ private struct TelemetryTable: View {
             TableColumn("RAM", value: \.ram) { row in
                 Text(row.ram)
                     .font(.body.monospacedDigit())
+                    .foregroundStyle(row.isForeground ? Color.secondary : Color.primary)
                     .frame(maxWidth: .infinity, alignment: .trailing)
             }
             .width(70)
@@ -123,13 +141,114 @@ private struct TelemetryTable: View {
         .animation(.easeInOut(duration: 0.2), value: state.processes.map(\.name))
     }
 
-    /// Tints high-CPU processes orange/red, matching Activity Monitor's convention.
+    @ViewBuilder
+    private func badge(_ text: String, color: Color) -> some View {
+        Text(text)
+            .font(.system(size: 9, weight: .bold))
+            .foregroundStyle(.white)
+            .padding(.horizontal, 5)
+            .padding(.vertical, 2)
+            .background(color, in: Capsule())
+    }
+
+    private func nameColor(for row: ProcessMetrics) -> Color {
+        if row.isForeground { return .blue }
+        if row.isThrottled  { return .orange }
+        return .primary
+    }
+
     private func cpuColor(_ cpuStr: String) -> Color {
-        let num = Double(cpuStr.replacingOccurrences(of: "%", with: "")
+        let num = Double(cpuStr
+            .replacingOccurrences(of: "%", with: "")
             .trimmingCharacters(in: .whitespaces)) ?? 0
         if num >= 20 { return .red }
         if num >= 5  { return .orange }
         return .primary
+    }
+}
+
+// MARK: - Config Panel
+
+private struct ConfigPanel: View {
+    let client: XPCClient
+
+    // Local state — initialised to daemon defaults (15 / 5).
+    @State private var throttleThreshold: Double = 15.0
+    @State private var releaseThreshold:  Double = 5.0
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Text("GOVERNOR THRESHOLDS")
+                .font(.system(size: 10, weight: .semibold))
+                .foregroundStyle(.secondary)
+                .kerning(0.8)
+
+            ThresholdRow(label: "Throttle above", value: $throttleThreshold, range: 5...95)
+            ThresholdRow(label: "Release below",  value: $releaseThreshold,  range: 1...90)
+        }
+        .padding(.horizontal, 14)
+        .padding(.vertical, 10)
+        // Send on every change, but enforce the hysteresis invariant first.
+        .onChange(of: throttleThreshold) { _, new in
+            // If the user pushes throttle down to or below release, nudge release down.
+            if releaseThreshold >= new {
+                releaseThreshold = max(1, new - 1)
+            }
+            sendConfig()
+        }
+        .onChange(of: releaseThreshold) { _, new in
+            // If the user pushes release up to or above throttle, nudge throttle up.
+            if throttleThreshold <= new {
+                throttleThreshold = min(95, new + 1)
+            }
+            sendConfig()
+        }
+    }
+
+    private func sendConfig() {
+        client.sendConfig(
+            throttleThreshold: throttleThreshold,
+            releaseThreshold:  releaseThreshold
+        )
+    }
+}
+
+private struct ThresholdRow: View {
+    let label: String
+    @Binding var value: Double
+    let range: ClosedRange<Double>
+
+    @State private var text: String = ""
+
+    var body: some View {
+        HStack(spacing: 8) {
+            Text(label)
+                .font(.system(size: 12))
+                .foregroundStyle(.secondary)
+                .frame(width: 110, alignment: .leading)
+
+            Slider(value: $value, in: range, step: 5.0)
+                .onChange(of: value) { _, new in
+                    text = String(format: "%.0f", new)
+                }
+
+            TextField("", text: $text)
+                .font(.system(size: 12).monospacedDigit())
+                .multilineTextAlignment(.trailing)
+                .frame(width: 46)
+                .onSubmit {
+                    if let d = Double(text), range.contains(d) {
+                        value = d
+                    } else {
+                        text = String(format: "%.0f", value)
+                    }
+                }
+
+            Text("%")
+                .font(.system(size: 12))
+                .foregroundStyle(.secondary)
+        }
+        .onAppear { text = String(format: "%.0f", value) }
     }
 }
 
@@ -154,8 +273,7 @@ private struct TrailingIconLabelStyle: LabelStyle {
     func makeBody(configuration: Configuration) -> some View {
         HStack(spacing: 4) {
             configuration.title
-            configuration.icon
-                .imageScale(.small)
+            configuration.icon.imageScale(.small)
         }
     }
 }

@@ -31,4 +31,10 @@ libc = "0.2"
 # set an Arc<AtomicBool>, which the worker thread polls each cycle.
 signal-hook = "0.3"
 
+# log: zero-cost structured logging facade.
+# Used in governor.rs for error! calls on Mach policy failures so that the
+# daemon never panics on permission errors — it logs and continues.
+# Initialized via a two-line inline StderrLogger in main.rs; no env_logger dep.
+log = "0.4"
+
 # Release profile is defined at the workspace root (Cargo.toml) per Cargo rules.

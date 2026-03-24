@@ -2,7 +2,7 @@
 //
 // Entry point for the Allocate watchdog daemon.
 //
-// ── Architecture (Phase 5) ────────────────────────────────────────────────────
+// ── Architecture (Phase 8) ────────────────────────────────────────────────────
 //
 //  Main thread ──► NSApplication + register_app_switch_observer(tx) + NSRunLoop.run()
 //
@@ -15,6 +15,10 @@
 //  XPC listener  ← GCD thread pool (libdispatch manages, no Rust thread)
 //                  Accepts connections; stores retained xpc_connection_t handles.
 //                  Clients receive table string as {"payload": "…"}.
+//
+// ── Early-exit CLI modes (no daemon loop) ────────────────────────────────────
+//
+//  --recover              Fire taskpolicy -B on all eligible user-space PIDs.
 
 mod battery;
 mod frontmost;
@@ -23,7 +27,7 @@ mod ipc;
 mod process;
 
 use std::sync::mpsc;
-use std::sync::{Arc, atomic::{AtomicBool, Ordering}};
+use std::sync::{Arc, RwLock, atomic::{AtomicBool, Ordering}};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -32,9 +36,31 @@ use objc2::runtime::AnyObject;
 
 use battery::{get_battery_state, BatteryState};
 use frontmost::{AppSwitchSignal, ForegroundApp};
-use governor::{Governor, run_recovery};
+use governor::{Governor, GovernorConfig, run_recovery};
 use ipc::IpcBroadcaster;
-use process::{compute_top_cpu, format_ram, take_snapshot, CpuSnapshot, ProcessMetrics};
+use process::{compute_top_cpu, format_ram, get_frontmost_metrics, take_snapshot, CpuSnapshot, ProcessMetrics};
+
+// ── Minimal stderr logger ─────────────────────────────────────────────────────
+//
+// A two-method `log::Log` implementation that writes to stderr. Zero external
+// deps: avoids pulling in env_logger or similar. Only ERROR-level messages are
+// emitted by default (matching the `log::set_max_level` call in `main`).
+
+struct StderrLogger;
+
+impl log::Log for StderrLogger {
+    fn enabled(&self, _meta: &log::Metadata) -> bool { true }
+
+    fn log(&self, record: &log::Record) {
+        if self.enabled(record.metadata()) {
+            eprintln!("[{}] {}", record.level(), record.args());
+        }
+    }
+
+    fn flush(&self) {}
+}
+
+static LOGGER: StderrLogger = StderrLogger;
 
 // ── Tuning constants ──────────────────────────────────────────────────────────
 
@@ -50,15 +76,25 @@ const SEP: &str = "────────────────────�
 // ── Entry point ───────────────────────────────────────────────────────────────
 
 fn main() {
-    // ── --recover: stateless escape hatch ──────────────────────────────────────
+    // ── Logger init ───────────────────────────────────────────────────────────
+    //
+    // Install the inline StderrLogger before any early-exit paths so that
+    // log::error! calls in governor.rs (and here) produce visible output.
+    // Errors are always shown; set RUST_LOG=debug to see lower-level records
+    // if a richer logger is wired in later.
+    log::set_logger(&LOGGER).expect("logger already set");
+    log::set_max_level(log::LevelFilter::Error);
+
+    let args: Vec<String> = std::env::args().collect();
+
+    // ── --recover: stateless escape hatch ─────────────────────────────────────
     //
     // Runs before NSApplication / XPC / signal setup so it executes cleanly
-    // even when the daemon is not registered with launchd.  SIGCONT on a
-    // running process is a POSIX no-op, so broadcasting to all eligible PIDs
-    // is safe.
-    if std::env::args().any(|a| a == "--recover") {
+    // even when the daemon is not registered with launchd.  Lifting the Mach
+    // background policy on a non-throttled process is idempotent.
+    if args.iter().any(|a| a == "--recover") {
         let n = run_recovery();
-        println!("[RECOVERY] Done — sent SIGCONT to {} process(es).", n);
+        println!("[RECOVERY] Done — lifted throttle on {} process(es).", n);
         std::process::exit(0);
     }
 
@@ -89,30 +125,36 @@ fn main() {
     signal_hook::flag::register(signal_hook::consts::SIGTERM, Arc::clone(&shutdown))
         .expect("Failed to register SIGTERM handler");
 
-    // ── Step 3: Start the XPC listener (GCD thread pool — no Rust thread) ────
+    // ── Step 3: Create the shared governor config ─────────────────────────────
     //
-    // Registers a named Mach service listener. Returns an IpcBroadcaster that
-    // the worker thread uses to push table strings to connected allocate-ui
-    // clients. Degrades to a no-op if the launchd plist is not installed.
-    let broadcaster = ipc::start_listener();
+    // Arc<RwLock<GovernorConfig>> is the two-way XPC bridge's shared state.
+    // The IPC GCD thread writes incoming config messages from the UI here;
+    // the worker thread reads it at the top of each evaluate() call.
+    let config = Arc::new(RwLock::new(GovernorConfig::default()));
 
-    // ── Step 4: Create the app-switch mpsc channel ────────────────────────────
+    // ── Step 4: Start the XPC listener (GCD thread pool — no Rust thread) ────
+    //
+    // Passes the config arc so the GCD event handler can update thresholds
+    // when the UI sends a config message. Degrades gracefully without launchd.
+    let broadcaster = ipc::start_listener(Arc::clone(&config));
+
+    // ── Step 5: Create the app-switch mpsc channel ────────────────────────────
     //
     // tx → moved into the ObjC notification block (fires on main thread).
     // rx → held by the worker thread, wakes on every app switch.
     let (tx, rx) = mpsc::channel::<AppSwitchSignal>();
 
-    // ── Step 5: Register the NSWorkspace event-driven observer ───────────────
+    // ── Step 6: Register the NSWorkspace event-driven observer ───────────────
     //
     // Passes tx into the ObjC block ('static, moved). _observer must live for
     // the process lifetime — dropping it deregisters the observer.
     let _observer = frontmost::register_app_switch_observer(tx);
 
-    // ── Step 6: Spawn the worker thread ──────────────────────────────────────
+    // ── Step 7: Spawn the worker thread ──────────────────────────────────────
     let shutdown_worker = Arc::clone(&shutdown);
-    thread::spawn(move || worker_loop(rx, broadcaster, shutdown_worker));
+    thread::spawn(move || worker_loop(rx, broadcaster, shutdown_worker, config));
 
-    // ── Step 7: Run the main NSRunLoop forever ────────────────────────────────
+    // ── Step 8: Run the main NSRunLoop forever ────────────────────────────────
     //
     // The NSRunLoop is the sole event pump for AppKit on this process. It must
     // run unblocked on the main thread. Every app switch causes the Window Server
@@ -123,7 +165,7 @@ fn main() {
     // calls release_all(), and exits. The NSRunLoop keeps running until the OS
     // terminates the process after the signal — this is the correct macOS daemon
     // lifecycle (launchd will SIGKILL if we do not exit promptly, but release_all
-    // will have already issued SIGCONT to all suspended PIDs).
+    // will have already fired taskpolicy -B on all throttled PIDs).
     //
     // SAFETY: NSRunLoop is always registered once Foundation is linked.
     unsafe {
@@ -135,11 +177,12 @@ fn main() {
 // ── Worker thread ─────────────────────────────────────────────────────────────
 
 fn worker_loop(
-    rx:         mpsc::Receiver<AppSwitchSignal>,
+    rx:          mpsc::Receiver<AppSwitchSignal>,
     broadcaster: IpcBroadcaster,
-    shutdown:   Arc<AtomicBool>,
+    shutdown:    Arc<AtomicBool>,
+    config:      Arc<RwLock<GovernorConfig>>,
 ) {
-    let mut governor = Governor::new();
+    let mut governor = Governor::new(config);
 
     // Block on the channel. Wakes the instant the OS fires the app-switch
     // notification — no polling sleep. recv() returns Err when all senders drop.
@@ -163,17 +206,30 @@ fn worker_loop(
         let snap2: CpuSnapshot = take_snapshot();
         let elapsed_ns = t0.elapsed().as_nanos() as u64;
 
-        let hogs: Vec<ProcessMetrics> =
+        // compute_top_cpu excludes fg.pid so the governor never evaluates it.
+        let mut hogs: Vec<ProcessMetrics> =
             compute_top_cpu(&snap1, &snap2, elapsed_ns, Some(fg.pid), TOP_N);
 
-        // ── Active mitigation: freeze / resume dummy-hog as needed ────────────
+        // ── Active mitigation: apply throttle policy on violators ─────────────
         governor.evaluate(&hogs);
+
+        for h in &mut hogs {
+            h.is_throttled = governor.is_throttled(h.pid);
+        }
+
+        // ── Build display rows ────────────────────────────────────────────────
+        // Frontmost is fetched after evaluate() so the governor never touches
+        // the active app.  It is prepended so build_table renders it as rank 0.
+        let mut rows: Vec<ProcessMetrics> = Vec::with_capacity(hogs.len() + 1);
+        if let Some(fm) = get_frontmost_metrics(fg.pid, &snap1, &snap2, elapsed_ns) {
+            rows.push(fm); // is_frontmost=true, rank 0
+        }
+        rows.extend(hogs); // background hogs, ranks 1..N
 
         // IOPowerSources: fast synchronous IOKit call (≤10 ms). None on desktops.
         let batt: Option<BatteryState> = get_battery_state();
 
-        // Build the table string once; print to terminal AND broadcast over XPC.
-        let table = build_table(&fg, &hogs, batt.as_ref());
+        let table = build_table(&fg, &rows, batt.as_ref());
         print!("{}", table);
         broadcaster.broadcast(&table);
     }
@@ -191,9 +247,16 @@ fn print_banner() {
 
 /// Builds the brutalist ASCII table as a String.
 /// Returned string is printed to terminal and broadcast over XPC to allocate-ui.
+///
+/// `rows[0]` (when `is_frontmost == true`) is rendered as rank 0 with the
+/// `FRONTMOST` tag.  Background hogs follow as ranks 1..N.
+///
+/// Column format (5 columns):
+///   │  0. <name>  | CPU: <pct>% | RAM: <ram> | Threads: <n> | FRONTMOST
+///   │  1. <name>  | CPU: <pct>% | RAM: <ram> | Threads: <n> | THROTTLED | OK
 fn build_table(
     fg:   &ForegroundApp,
-    hogs: &[ProcessMetrics],
+    rows: &[ProcessMetrics],
     batt: Option<&BatteryState>,
 ) -> String {
     let batt_str = match batt {
@@ -205,21 +268,39 @@ fn build_table(
         }
     };
 
-    let mut out = String::with_capacity(512);
+    // Partition rows into frontmost (0 or 1) and background hogs.
+    let frontmost  = rows.first().filter(|h| h.is_frontmost);
+    let hog_offset = frontmost.map_or(0, |_| 1);
+    let hogs       = &rows[hog_offset..];
+
+    let mut out = String::with_capacity(640);
     out.push_str(&format!("┌{SEP}\n"));
     out.push_str(&format!("│ 🟢 ACTIVE: {} (PID: {}){}\n", fg.name, fg.pid, batt_str));
     out.push_str(&format!("├{SEP}\n"));
-    out.push_str("│ ⚠️  BACKGROUND HOGS\n");
 
+    // ── Rank-0 frontmost row (real CPU/RAM/threads) ───────────────────────────
+    if let Some(fm) = frontmost {
+        let ram  = format_ram(fm.resident_bytes);
+        let name = if fm.name.len() > 24 { &fm.name[..24] } else { &fm.name };
+        out.push_str(&format!(
+            "│ {:>2}. {:<24} | CPU: {:>5.1}% | RAM: {:>6} | Threads: {} | FRONTMOST\n",
+            0, name, fm.cpu_pct, ram, fm.threadnum,
+        ));
+        out.push_str(&format!("├{SEP}\n"));
+    }
+
+    // ── Background hogs ───────────────────────────────────────────────────────
+    out.push_str("│ ⚠️  BACKGROUND HOGS\n");
     if hogs.is_empty() {
-        out.push_str("│   (none above 0.1% threshold)\n");
+        out.push_str("│   (none above threshold)\n");
     } else {
         for (i, h) in hogs.iter().enumerate() {
             let ram  = format_ram(h.resident_bytes);
             let name = if h.name.len() > 24 { &h.name[..24] } else { &h.name };
+            let tag  = if h.is_throttled { "THROTTLED" } else { "OK" };
             out.push_str(&format!(
-                "│ {:>2}. {:<24} | CPU: {:>5.1}% | RAM: {:>6} | Threads: {}\n",
-                i + 1, name, h.cpu_pct, ram, h.threadnum,
+                "│ {:>2}. {:<24} | CPU: {:>5.1}% | RAM: {:>6} | Threads: {} | {}\n",
+                i + 1, name, h.cpu_pct, ram, h.threadnum, tag,
             ));
         }
     }

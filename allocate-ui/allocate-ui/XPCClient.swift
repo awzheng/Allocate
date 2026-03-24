@@ -27,11 +27,13 @@ import Foundation
 // MARK: - Data Models
 
 struct ProcessMetrics: Identifiable {
-    let id: Int           // process rank (1-based)
+    let id: Int           // process rank (1-based); 0 = synthetic foreground row
     let name: String
-    let cpu: String       // e.g. "  5.1%"
-    let ram: String       // e.g. " 120 MB"
-    let threads: String   // e.g. "8"
+    let cpu: String       // e.g. "  5.1%" or "—" for the foreground row
+    let ram: String       // e.g. " 120 MB" or "—"
+    let threads: String   // e.g. "8" or "—"
+    let isThrottled: Bool // true when the governor has applied taskpolicy -b
+    let isForeground: Bool // true for the synthetic pinned foreground row
 }
 
 struct TelemetryState {
@@ -50,7 +52,8 @@ struct TelemetryState {
 ///   │ 🟢 ACTIVE: AppName (PID: 12345) | 🔋 100% (Battery)
 ///   ├──...
 ///   │ ⚠️  BACKGROUND HOGS
-///   │  1. ProcessName             | CPU:   5.1% | RAM:  120 MB | Threads: 8
+///   │  1. ProcessName             | CPU:   5.1% | RAM:  120 MB | Threads: 8 | OK
+///   │  2. HogProcess              | CPU:  42.0% | RAM:  800 MB | Threads: 4 | THROTTLED
 ///   └──...
 private func parseTelemetry(_ payload: String) -> TelemetryState {
     var state = TelemetryState()
@@ -78,9 +81,10 @@ private func parseTelemetry(_ payload: String) -> TelemetryState {
         }
 
         // ── Process row ─────────────────────────────────────────────────────
-        // "1. ProcessName             | CPU:   5.1% | RAM:  120 MB | Threads: 8"
+        // "1. ProcessName             | CPU:   5.1% | RAM:  120 MB | Threads: 8 | OK"
+        // "2. HogProcess              | CPU:  42.0% | RAM:  800 MB | Threads: 4 | THROTTLED"
         let parts = content.components(separatedBy: " | ")
-        guard parts.count == 4 else { continue }
+        guard parts.count == 5 else { continue }
 
         // parts[0] = "1. ProcessName   "
         let namePart = parts[0]
@@ -101,9 +105,15 @@ private func parseTelemetry(_ payload: String) -> TelemetryState {
         let threads = parts[3].replacingOccurrences(of: "Threads:", with: "")
             .trimmingCharacters(in: .whitespaces)
 
+        // parts[4] = "FRONTMOST" | "THROTTLED" | "OK"
+        let tag = parts[4].trimmingCharacters(in: .whitespaces)
+        let isForeground = tag == "FRONTMOST"
+        let isThrottled  = tag == "THROTTLED"
+
         rank += 1
         state.processes.append(ProcessMetrics(
-            id: rank, name: name, cpu: cpu, ram: ram, threads: threads
+            id: rank, name: name, cpu: cpu, ram: ram, threads: threads,
+            isThrottled: isThrottled, isForeground: isForeground
         ))
     }
 
@@ -202,5 +212,28 @@ final class XPCClient {
         xpc_connection_send_message(conn, ping)
 
         self.connection = conn
+    }
+
+    // MARK: - Config
+
+    /// Sends updated governor thresholds to the daemon.
+    ///
+    /// Fire-and-forget: the daemon's GCD XPC handler writes the new values into
+    /// its Arc<RwLock<GovernorConfig>> asynchronously.  No response is expected.
+    ///
+    /// - Parameters:
+    ///   - throttleThreshold: CPU% at which the governor throttles a process.
+    ///   - releaseThreshold:  CPU% below which a throttled process is released.
+    func sendConfig(throttleThreshold: Double, releaseThreshold: Double) {
+        guard let conn = connection else { return }
+        // Enforce the hysteresis invariant before sending.
+        guard releaseThreshold < throttleThreshold, throttleThreshold > 0 else { return }
+
+        let msg = xpc_dictionary_create(nil, nil, 0)
+        xpc_dictionary_set_string(msg, "type", "config")
+        xpc_dictionary_set_double(msg, "throttle_threshold", throttleThreshold)
+        xpc_dictionary_set_double(msg, "release_threshold",  releaseThreshold)
+        xpc_connection_send_message(conn, msg)
+        // xpc_release omitted: send_message retains the dict for async delivery.
     }
 }

@@ -41,6 +41,7 @@
       "size" : "256x256"
     },
     {
+      "filename" : "allocate-icon-macOS-Default-512x512@1x.png",
       "idiom" : "mac",
       "scale" : "1x",
       "size" : "512x512"

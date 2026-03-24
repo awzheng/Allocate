@@ -109,6 +109,12 @@ pub struct ProcessMetrics {
     pub cpu_pct:        f64,
     pub resident_bytes: u64,
     pub threadnum:      i32,
+    /// Set to true by the governor after evaluate() if this PID is actively
+    /// throttled via taskpolicy. Always false as returned from compute_top_cpu.
+    pub is_throttled:   bool,
+    /// Set to true for the frontmost (active foreground) PID row.
+    /// Always false as returned from compute_top_cpu; set by the worker loop.
+    pub is_frontmost:   bool,
 }
 
 // ── Public formatting helper ──────────────────────────────────────────────────
@@ -318,6 +324,8 @@ pub fn compute_top_cpu(
                     cpu_pct:        pct,
                     resident_bytes: *resident_bytes,
                     threadnum:      *threadnum,
+                    is_throttled:   false, // annotated by Governor::evaluate()
+                    is_frontmost:   false, // annotated by the worker loop
                 })
             } else {
                 None
@@ -329,6 +337,40 @@ pub fn compute_top_cpu(
         .unwrap_or(std::cmp::Ordering::Equal));
     metrics.truncate(top_n);
     metrics
+}
+
+/// Fetches real-time metrics for a single PID regardless of its CPU%.
+///
+/// Used to include the frontmost (foreground) app in the telemetry table even
+/// when its CPU usage is below the 0.1% noise floor that `compute_top_cpu`
+/// filters out.  Returns `None` only if the PID is absent from `s2` (process
+/// vanished between the two snapshots).
+pub fn get_frontmost_metrics(
+    pid:        i32,
+    s1:         &CpuSnapshot,
+    s2:         &CpuSnapshot,
+    elapsed_ns: u64,
+) -> Option<ProcessMetrics> {
+    let (name, cpu2, resident_bytes, threadnum, uid) = s2.get(&pid)?;
+
+    let cpu_pct = if elapsed_ns > 0 {
+        let cpu1 = s1.get(&pid).map_or(0u64, |(_, c, _, _, _)| *c);
+        let delta = cpu2.saturating_sub(cpu1);
+        (delta as f64 / elapsed_ns as f64) * 100.0
+    } else {
+        0.0
+    };
+
+    Some(ProcessMetrics {
+        pid,
+        name:           name.clone(),
+        uid:            *uid,
+        cpu_pct,
+        resident_bytes: *resident_bytes,
+        threadnum:      *threadnum,
+        is_throttled:   false,
+        is_frontmost:   true,
+    })
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
