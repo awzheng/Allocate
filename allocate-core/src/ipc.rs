@@ -70,6 +70,11 @@ extern "C" {
         xdict: XpcObjectT,
         key:   *const libc::c_char,
     ) -> f64;
+    fn xpc_dictionary_set_double(
+        xdict: XpcObjectT,
+        key:   *const libc::c_char,
+        value: f64,
+    );
 
     fn xpc_connection_send_message(connection: XpcObjectT, message: XpcObjectT);
     fn dispatch_get_global_queue(identifier: libc::c_long, flags: libc::c_ulong)
@@ -95,7 +100,7 @@ pub struct IpcBroadcaster {
 }
 
 impl IpcBroadcaster {
-    pub fn broadcast(&self, payload: &str) {
+    pub fn broadcast(&self, payload: &str, system_cpu: f64) {
         let clients = match self.clients.lock() {
             Ok(g)  => g,
             Err(_) => return,
@@ -107,12 +112,14 @@ impl IpcBroadcaster {
             Ok(s)  => s,
             Err(_) => return,
         };
-        let key_cstr = CString::new("payload").expect("static string");
+        let key_payload    = CString::new("payload").expect("static string");
+        let key_system_cpu = CString::new("system_cpu").expect("static string");
 
         unsafe {
             let msg = xpc_dictionary_create_empty();
             if msg.is_null() { return; }
-            xpc_dictionary_set_string(msg, key_cstr.as_ptr(), payload_cstr.as_ptr());
+            xpc_dictionary_set_string(msg, key_payload.as_ptr(), payload_cstr.as_ptr());
+            xpc_dictionary_set_double(msg, key_system_cpu.as_ptr(), system_cpu);
             for client in clients.iter() {
                 xpc_connection_send_message(client.0, msg);
             }

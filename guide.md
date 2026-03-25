@@ -1,332 +1,144 @@
-> ## 🛑 STRICT AI DIRECTIVE
+> ## STRICT AI DIRECTIVE
 > **AI AGENTS: Never modify `.rs` source code files when instructed to update, compress, or read documentation. Keep domain scopes strictly isolated.**
 
 ---
 
-# Allocate — Run Guide
-**Updated**: 2026-03-16
+# Allocate — Developer Manual & Testing Guide
 
 ---
 
-## What Allocate Does
+## Core Commands
 
-Every time you switch apps, `allocate-core` wakes up **instantly** and prints a hardware telemetry table to the terminal:
-
-```
-┌──────────────────────────────────────────────────────────
-│ 🟢 ACTIVE: Xcode (PID: 25172) | 🔋 82% (Battery)
-├──────────────────────────────────────────────────────────
-│ ⚠️  BACKGROUND HOGS
-│  1. Google Chrome Helper   | CPU:   0.5% | RAM: 450 MB | Threads: 32
-│  2. UniversalControl       | CPU:   0.2% | RAM:  85 MB | Threads: 12
-│  3. Docker                 | CPU:   0.1% | RAM: 2.1 GB | Threads: 18
-└──────────────────────────────────────────────────────────
-```
-
-It also forwards this table string over **XPC** to any connected `allocate-ui` SwiftUI client.
+| Purpose | Command |
+|---|---|
+| Compile backend (release) | `cargo build --release -p allocate-core` |
+| Deploy as launchd service | `sudo ./scripts/install_agent.sh` |
+| Stop background service | `launchctl unload ~/Library/LaunchAgents/com.andrewzheng.allocate.daemon.plist` |
+| Force-kill daemon | `sudo killall allocate-core` |
+| Run daemon in foreground (live logging) | `sudo ./target/release/allocate-core` |
+| Stream daemon logs | `tail -f /tmp/allocate-daemon.log` |
+| Stateless E-core recovery | `sudo ./target/release/allocate-core --recover` |
 
 ---
 
-## Mental Model: How It Works
+## Throttle Mechanism
 
-### Three concurrent actors
+The governor calls `/usr/sbin/taskpolicy` — a SIP-compliant Apple tool — to adjust XNU QoS:
 
-```
-┌─────────────────────────────────────────────────────────────────┐
-│  Main thread                                                    │
-│  NSApplication (opens Window Server session)                    │
-│  ↓ registers ObjC block on NSWorkspace notification centre      │
-│  NSRunLoop.run() — pumps Window Server events forever           │
-│               │                                                 │
-│         App switch happens                                      │
-│               │                                                 │
-│    Block fires on main thread instantly                         │
-│    Extracts name + PID from notification userInfo               │
-│    tx.send(AppSwitchSignal { name, pid })  ──────────────────── │
-└──────────────────────────────────────────────────────│──────────┘
-                                                       │ mpsc channel
-┌──────────────────────────────────────────────────────▼──────────┐
-│  Worker thread                                                  │
-│  rx.recv() ← blocks here until signal arrives                   │
-│  take_snapshot()  ← proc_pidinfo syscall for all processes      │
-│  sleep 500 ms                                                   │
-│  take_snapshot()  ← second syscall                              │
-│  compute diff → CPU% | RAM | Threads per process                │
-│  get_battery_state() ← IOKit IOPowerSources                     │
-│  build_table() → String                                         │
-│  print!() + broadcaster.broadcast()  ────────────────────────── │
-└──────────────────────────────────────────────────────│──────────┘
-                                                       │ XPC dict
-┌──────────────────────────────────────────────────────▼──────────┐
-│  XPC listener (GCD thread pool — no Rust thread)                │
-│  com.andrewzheng.allocate.daemon                                │
-│  Accepts NSXPCConnection from allocate-ui                       │
-│  Sends {"payload": "<table string>"} to each client             │
-└─────────────────────────────────────────────────────────────────┘
-```
+| Action | Command issued | Effect |
+|---|---|---|
+| Throttle | `taskpolicy -b -p <pid>` | Background QoS → process pinned to E-cores (~25% throughput) |
+| Release | `taskpolicy -B -p <pid>` | Restore QoS → process returns to full P+E-core scheduling |
 
-### Why NSRunLoop on the main thread?
-`NSWorkspace.frontmostApplication` only returns live data when the main thread is
-running its `NSRunLoop`. Without it, the Window Server cache freezes. So the main
-thread **only** runs the event loop — all sleeping and computation happens on the worker.
-
-### Why mpsc instead of polling?
-Old design: worker thread slept 2 seconds then polled. Every switch had a ≤2 s lag.
-New design: the OS fires a notification the moment the switch happens. The ObjC block
-sends it to the worker via `mpsc::Sender`. No sleep between switches at all.
-
-### The 500 ms window
-CPU % requires two snapshots. We take one, sleep 500 ms, take another, then diff.
-This 500 ms gap is the **only** sleep remaining in the entire architecture.
-
-### Battery
-`get_battery_state()` calls `IOPSCopyPowerSourcesInfo()` + `IOPSCopyPowerSourcesList()`
-from Apple's IOKit framework — the same underlying API as `pmset -g batt`. No
-TCC permission required. Returns `None` on desktops without a battery (no badge shown).
+**Default thresholds:** throttle at **15% CPU**, release at **5% CPU** (hysteresis gap prevents oscillation). Eligibility: `uid >= 500`, not in hardcoded deny-list (`WindowServer`, `Dock`, `Finder`, `coreaudiod`, etc.).
 
 ---
 
-## Prerequisites
+## Workflow A — Synthetic Test (`dummy-hog`)
 
-```bash
-# Verify Rust toolchain
-~/.rustup/toolchains/stable-aarch64-apple-darwin/bin/rustc --version
+Validates the governor against a controlled 100% CPU load in a terminal environment.
 
-# Add to ~/.zshrc (then: source ~/.zshrc)
-export PATH="$HOME/.rustup/toolchains/stable-aarch64-apple-darwin/bin:$HOME/.cargo/bin:$PATH"
+1. **Terminal A — Launch the load generator:**
+   ```bash
+   cd /Users/andrewzheng/Allocate
+   cargo run -p dummy-hog
+   ```
+   `dummy-hog` spins threads computing primes. CPU climbs to >100%.
 
-cargo --version   # confirms cargo is accessible
-```
+2. **Terminal B — Run the daemon (foreground, live output):**
+   ```bash
+   cd /Users/andrewzheng/Allocate
+   sudo ./target/release/allocate-core
+   ```
 
----
+3. **Trigger:** Press `⌘-Tab` to switch focus to any other app.
 
-## Section 1: Terminal MVP Testing (dummy-hog)
+4. **Expected output in Terminal B:**
+   ```
+   │  1. dummy-hog               | CPU: 102.3% | RAM:  12 MB | Threads:  9 | THROTTLED
+   ```
+   `taskpolicy -b` fires. `dummy-hog` drops to ~25% CPU — pinned to E-cores.
 
-This workflow tests the governor in a safe, controlled terminal environment using our synthetic load generator.
-
-### Step 1 (The Target)
-Open **Terminal A** and launch the intentional CPU hog:
-
-```bash
-cd /Users/andrewzheng/Allocate
-cargo run -p dummy-hog
-```
-
-*This safely spins up threads to calculate prime numbers, spiking its CPU usage to >100% without destabilizing the system.*
-
-### Step 2 (The Governor)
-Open **Terminal B** and run the core daemon with root privileges:
-
-```bash
-cd /Users/andrewzheng/Allocate
-sudo cargo run -p allocate-core
-```
-
-> **Why `sudo`?** The governor needs root authority to issue `SIGSTOP` / `SIGCONT` signals to other processes, and to read `proc_pidinfo` telemetry globally.
-
-### Step 3 (The Trigger)
-The daemon is armed. **Switch focus to any other app** (e.g., click on Chrome or the Finder desktop).
-
-This instantly triggers the background worker loop. In **Terminal B**, the brutalist telemetry table will appear, followed immediately by:
-
-```
-[GOV] SIGSTOP (freeze) → pid <N>
-```
-
-*The dummy-hog process is now suspended indefinitely via a kernel-level freeze. Activity Monitor will show its status as "Stopped".*
-
-To clean up safely, press **Ctrl+C** in Terminal B. The graceful shutdown hook will automatically issue `SIGCONT` to dummy-hog before exiting.
+5. **Cleanup:** `Ctrl+C` in Terminal B. The graceful shutdown hook calls `release_all()`, which fires `taskpolicy -B` on every throttled PID before exit. `dummy-hog` returns to full CPU.
 
 ---
 
-## Section 2: Production Live Fire (Minecraft)
+## Workflow B — Real-World Test (Minecraft)
 
-This workflow tests the fully dynamic targeting matrix (`uid >= 500` + CPU threshold + `IGNORE_NAMES` deny-list) on a real-world application, while running as a true background launchd daemon.
+Validates the governor against a real user-space application. Minecraft's Java process (`java`) runs in windowed mode — no Metal fullscreen, no kernel graphical wake-lock.
 
-### Step 1 (Compile & Install)
-Compile the release binary and install the LaunchAgent:
+> **Why windowed?** Fullscreen Metal apps hold a kernel display wake-lock that can bypass QoS policy changes. Always test in windowed mode to keep the throttle path clean.
 
-```bash
-cd /Users/andrewzheng/Allocate
-cargo build --release -p allocate-core
-chmod +x scripts/install_agent.sh
-./scripts/install_agent.sh
-```
+1. **Deploy the daemon as a background service (if not already running):**
+   ```bash
+   sudo ./scripts/install_agent.sh
+   tail -f /tmp/allocate-daemon.log
+   ```
 
-### Step 2 (The Target)
-Launch your target user-space application (e.g., **Minecraft** or a heavy Docker container build) and force it to do heavy work to push its CPU past the 5.0% threshold.
+2. **Launch Minecraft in windowed mode.** Load a world and generate heavy CPU load: enter a dense chunk border, enable high render distance, or detonate a TNT chain. Confirm `java` exceeds 15% CPU in Activity Monitor.
 
-### Step 3 (The Trigger)
-While the app is under heavy load, **Command-Tab (⌘-Tab)** to any other application. 
+3. **Trigger:** `⌘-Tab` to any other app (Terminal, Finder, etc.).
 
-The background `allocate-core` daemon will immediately catch the app-switch event, snapshot the CPU, see the game exceeding 5.0%, and issue `SIGCONT` to freeze it instantly. You will notice the game application freeze entirely (audio stops, UI pinwheels).
+4. **Verify in the log:**
+   ```
+   │  1. java                    | CPU:  87.4% | RAM: 1.8 GB | Threads: 42 | THROTTLED
+   ```
+   Minecraft audio continues (coreaudiod is on the deny-list). Only the `java` process is pinned to E-cores.
 
-### Step 4 (Verify)
-Check the daemon logs to verify the mitigation fired correctly on the target PID:
-
-```bash
-tail -n 20 /tmp/allocate-daemon.log
-```
+5. **Return to Minecraft.** The frontmost-app guard immediately exempts the `java` PID from evaluation. The governor releases the throttle within one 1 Hz tick.
 
 ---
 
-## Section 3: Emergency Recovery
+## Workflow C — Graceful Shutdown
 
-If a process is left frozen (e.g. if the daemon was killed via `SIGKILL` before the graceful shutdown could execute, or if an environment overlap blinded the daemon to the frozen process), use these recovery methods.
+Verifies that no process is permanently stranded on E-cores after a daemon exit.
 
-### Primary: Stateless Defibrillator
-`allocate-core` includes a dedicated stateless recovery mode that bypasses all daemon logic and broadcasts a wake-up signal to every eligible user-space process on the system:
+1. **Confirm a process is throttled.** Run Workflow A or B until the THROTTLED tag appears in the table.
 
+2. **Kill the foreground daemon with `Ctrl+C`** (or send SIGTERM to the launchd service).
+
+3. **What happens internally:**
+   - `signal_hook` sets the `AtomicBool` shutdown flag.
+   - The worker loop detects it at the top of the next tick (≤100 ms).
+   - `graceful_shutdown()` calls `governor.release_all()`.
+   - `release_all()` fires `taskpolicy -B -p <pid>` for every PID in the `suspended` HashSet.
+   - `std::process::exit(0)`.
+
+4. **Verify in Activity Monitor:** Within one second, the previously-throttled process returns to normal scheduling. CPU% climbs back to its natural value on P+E-cores. The "Stopped" state never appears — `taskpolicy` does not suspend; it only adjusts QoS.
+
+---
+
+## Emergency Recovery
+
+If the daemon was killed via `SIGKILL` before `release_all()` could execute (e.g. `sudo killall -9 allocate-core`), any throttled PIDs remain on E-cores with no running daemon to release them.
+
+**Stateless defibrillator — no daemon required:**
 ```bash
-cd /Users/andrewzheng/Allocate
 sudo ./target/release/allocate-core --recover
 ```
 
-Expected output:
-```
-[RECOVERY] Woke up java (PID 45432)
-[RECOVERY] Done — sent SIGCONT to 1 process(es).
-```
+Scans all running processes, fires `taskpolicy -B` on every eligible user-space PID. Idempotent — safe to run on non-throttled processes.
 
-### Fallback: Raw Unix Signal
-If the targeting matrix itself is blocking the recovery, you can manually unfreeze a specific process using standard POSIX signals. First, find the PID in Activity Monitor or via `ps`, then run:
-
+**Manual fallback (single PID):**
 ```bash
-sudo kill -CONT <pid>
-```
-
-### Mode 2: LaunchAgent + XPC (production / allocate-ui integration)
-
-Run the install script **once**:
-
-```bash
-chmod +x scripts/install_agent.sh
-./scripts/install_agent.sh
-```
-
-The script:
-1. Builds the release binary (if needed)
-2. Writes `~/Library/LaunchAgents/com.andrewzheng.allocate.daemon.plist` with the
-   `MachServices` entry XPC requires and `ALLOCATE_XPC_ENABLE=1` injected via
-   `EnvironmentVariables`
-3. Loads the agent via `launchctl load`
-
-Follow live output:
-
-```bash
-tail -f /tmp/allocate-daemon.log
-```
-
-The Brutalist UI table appears there whenever you switch apps.
-
-To uninstall:
-
-```bash
-launchctl unload ~/Library/LaunchAgents/com.andrewzheng.allocate.daemon.plist
-rm ~/Library/LaunchAgents/com.andrewzheng.allocate.daemon.plist
+/usr/sbin/taskpolicy -B -p <pid>
 ```
 
 ---
 
-## Building allocate-ui in Xcode
-
-### Step 1 — Create the Xcode project
-
-1. Open **Xcode** (Spotlight → `Xcode`)
-2. Click **Create New Project…** (or **File → New → Project…**)
-3. Choose **macOS** tab → **App** → click **Next**
-4. Fill in:
-   - **Product Name**: `allocate-ui`
-   - **Organization Identifier**: `com.andrewzheng`
-   - **Bundle Identifier** (auto-filled): `com.andrewzheng.allocate-ui`
-   - **Interface**: `SwiftUI`
-   - **Language**: `Swift`
-   - Uncheck **Include Tests** (not needed)
-5. Click **Next**, then save **inside** `/Users/andrewzheng/Allocate/allocate-ui/`
-
-> Xcode will create several boilerplate files. You will replace most of them.
-
----
-
-### Step 2 — Replace the boilerplate Swift files
-
-Xcode creates `allocate_uiApp.swift` (or similar) and `ContentView.swift` by default.
-
-**Delete the Xcode-generated stubs and add the repo files:**
-
-1. In the **Project Navigator** (left sidebar), select the boilerplate files, right-click → **Delete** → **Move to Trash**
-2. Right-click the `allocate-ui` folder in the Navigator → **Add Files to "allocate-ui"…**
-3. Navigate to `/Users/andrewzheng/Allocate/allocate-ui/` and add:
-   - `AllocateApp.swift`
-   - `XPCClient.swift`
-   - `ContentView.swift`
-4. Make sure **"Copy items if needed"** is **unchecked** (they are already in the right folder)
-5. Confirm **"Add to target: allocate-ui"** is checked
-
----
-
-### Step 3 — Disable the App Sandbox (critical for XPC)
-
-> **Why?** macOS's App Sandbox blocks third-party Mach bootstrap lookups. Without removing it, `xpc_connection_create_mach_service` silently fails to resolve the daemon's service name and the UI never receives any data.
-
-1. In the Navigator, click the **blue `allocate-ui` project icon** at the very top
-2. Click the **`allocate-ui` target** (under TARGETS) in the center panel
-3. Click the **Signing & Capabilities** tab
-4. Find the **App Sandbox** capability row — click the **`–` (minus) button** on the left to remove it entirely
-5. Confirm the removal in the dialog
-
-The entitlements file should now have **no** `com.apple.security.app-sandbox` entry (or the file will be deleted entirely).
-
----
-
-### Step 4 — Set the deployment target
-
-1. Still in the project editor, click the **Build Settings** tab
-2. Search for `MACOSX_DEPLOYMENT_TARGET`
-3. Set it to **`13.0`** (MenuBarExtra and `@Observable` require macOS 13+)
-
----
-
-### Step 5 — Configure Info.plist for Menu Bar only
-
-To prevent a Dock icon from appearing:
-
-1. Click **Info** tab in the target editor
-2. Add a new row: key = `Application is agent (UIElement)`, value = **YES**
-   (This is the `LSUIElement` key)
-
----
-
-### Step 6 — Build & Run
-
-1. Press **⌘R** (or Product → Run)
-2. Xcode builds and launches `allocate-ui`
-3. A frosted-glass HUD panel appears floating on your screen.
-
-Because it is a **Floating HUD** (`NSPanel` with `.floating` level), it will stay persistently on top of all other windows even as you switch apps — perfect for live monitoring.
-
-**If the daemon is running** (`./scripts/install_agent.sh` has been run):
-- The **● Live** indicator appears green
-- Switch apps → the brutalist table updates instantly in the HUD
-
-**If the daemon is NOT running:**
-- The HUD shows "Daemon not running" with a crossed-out antenna symbol
-- Start it: `./scripts/install_agent.sh`
-
----
-
-## Source File Map
+## Source Map
 
 | Layer | File | Responsibility |
-|-------|------|----------------|
-| **Rust daemon** | `src/main.rs` | Entry point, broadcaster wiring, `build_table()` |
-| | `src/frontmost.rs` | ObjC notification observer, mpsc sender |
-| | `src/process.rs` | `proc_pidinfo` CPU/RAM/thread, `compute_top_cpu` |
-| | `src/battery.rs` | IOKit IOPowerSources FFI, `CfRelease` RAII |
-| | `src/ipc.rs` | Raw `libxpc` listener, `IpcBroadcaster`, env guard |
-| **Swift UI** | `AllocateApp.swift` | `@main`, `NSPanel` Persistent Floating HUD |
+|---|---|---|
+| **Rust** | `src/main.rs` | Entry point, worker loop, `build_table()`, signal handling |
+| | `src/frontmost.rs` | ObjC `NSWorkspace` observer, `mpsc::Sender` |
+| | `src/process.rs` | `proc_pidinfo` CPU/RAM/threads, `compute_top_cpu` |
+| | `src/governor.rs` | `taskpolicy` actuator, hysteresis, `GovernorConfig` |
+| | `src/battery.rs` | IOKit `IOPowerSources` FFI |
+| | `src/ipc.rs` | Raw `libxpc` listener, `IpcBroadcaster`, config bridge |
+| **Swift** | `AllocateApp.swift` | `@main`, `NSPanel` floating HUD |
 | | `XPCClient.swift` | XPC C API, `@Observable`, `@MainActor` |
-| | `ContentView.swift` | `ultraThinMaterial`, SF Pro/Symbols, vibrancy |
+| | `ContentView.swift` | `ultraThinMaterial`, SF Pro/Symbols |
 | **Scripts** | `scripts/install_agent.sh` | LaunchAgent plist + `launchctl load` |
 
 ---
@@ -334,13 +146,11 @@ Because it is a **Floating HUD** (`NSPanel` with `.floating` level), it will sta
 ## Troubleshooting
 
 | Symptom | Cause | Fix |
-|---------|-------|-----|
-| No table after startup | No app switch yet | Switch to any other app |
-| All CPU% = 0% | No root access | `sudo ./target/debug/allocate-core` |
-| Battery badge absent | Desktop Mac (no battery) | Expected — `None` returned |
-| `[DEBUG] XPC bypassed…` | No `ALLOCATE_XPC_ENABLE` env var | Use `scripts/install_agent.sh` for XPC mode |
-| allocate-ui shows "Daemon not running" | Agent not loaded | Run `./scripts/install_agent.sh` |
-| allocate-ui shows "Daemon not running" (even after install) | App Sandbox still enabled | Remove App Sandbox in Xcode → Signing & Capabilities |
-| Xcode build error: `'xpc_get_type' unavailable` | Deployment target < 13 | Set `MACOSX_DEPLOYMENT_TARGET = 13.0` |
-
-
+|---|---|---|
+| No table after startup | No app switch detected yet | `⌘-Tab` to any other app |
+| All CPU% = 0% | Missing root | `sudo ./target/release/allocate-core` |
+| THROTTLED tag never appears | Process CPU below 15% threshold | Push load past threshold, or lower it in the UI |
+| Process stays throttled after daemon exit | Daemon received `SIGKILL`, skipped `release_all()` | `sudo ./target/release/allocate-core --recover` |
+| allocate-ui shows "Daemon not running" | LaunchAgent not loaded | `sudo ./scripts/install_agent.sh` |
+| allocate-ui shows "Daemon not running" (post-install) | App Sandbox still enabled | Xcode → Signing & Capabilities → remove App Sandbox |
+| Battery badge absent | Desktop Mac, no battery | Expected — `get_battery_state()` returns `None` |

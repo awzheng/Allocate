@@ -20,6 +20,10 @@ const PROC_ALL_PIDS:         u32   = 1;
 const PROC_PIDTASKINFO:      c_int = 4;  // struct proc_taskinfo (cpu ns, rss, vss, threads)
 const PROC_PIDTBSDSHORTINFO: c_int = 13; // struct proc_bsdshortinfo (name, uid, ppid)
 
+// Mach host_statistics constants for system-wide CPU load.
+const HOST_CPU_LOAD_INFO:       i32 = 3; // flavor: host_cpu_load_info
+const HOST_CPU_LOAD_INFO_COUNT: u32 = 4; // struct size in natural_t (u32) units
+
 // ── FFI declarations ──────────────────────────────────────────────────────────
 
 #[link(name = "proc")]
@@ -40,6 +44,26 @@ extern "C" {
     ) -> c_int;
 
     fn proc_name(pid: c_int, buffer: *mut u8, buffersize: u32) -> c_int;
+}
+
+// ── FFI: Mach host statistics ─────────────────────────────────────────────────
+//
+// `host_cpu_load_info` returns four u32 tick counters:
+//   [0] CPU_STATE_USER, [1] CPU_STATE_SYSTEM, [2] CPU_STATE_IDLE, [3] CPU_STATE_NICE
+// Diffing two snapshots gives instantaneous system-wide CPU utilisation.
+//
+// Both functions live in libSystem.dylib (always linked on macOS).
+// KERN_SUCCESS = 0.
+
+#[link(name = "System", kind = "dylib")]
+extern "C" {
+    fn mach_host_self() -> u32;
+    fn host_statistics(
+        host:             u32,
+        flavor:           i32,
+        host_info_out:    *mut u32,
+        host_info_outCnt: *mut u32,
+    ) -> i32;
 }
 
 // ── C struct mirrors ──────────────────────────────────────────────────────────
@@ -371,6 +395,41 @@ pub fn get_frontmost_metrics(
         is_throttled:   false,
         is_frontmost:   true,
     })
+}
+
+/// Reads the four Mach CPU-tick counters [user, system, idle, nice] atomically.
+///
+/// Returns None only if `host_statistics` fails (should never happen in practice).
+/// Call twice and diff with `compute_system_cpu_pct` to get instantaneous load.
+pub fn read_host_cpu_ticks() -> Option<[u32; 4]> {
+    let mut ticks = [0u32; HOST_CPU_LOAD_INFO_COUNT as usize];
+    let mut count = HOST_CPU_LOAD_INFO_COUNT;
+
+    let ret = unsafe {
+        host_statistics(
+            mach_host_self(),
+            HOST_CPU_LOAD_INFO,
+            ticks.as_mut_ptr(),
+            &mut count,
+        )
+    };
+
+    if ret == 0 { Some(ticks) } else { None } // KERN_SUCCESS == 0
+}
+
+/// Computes system-wide CPU% from two `host_cpu_load_info` tick snapshots.
+///
+/// Formula: busy / total where busy = user + system + nice.
+/// Uses wrapping subtraction to handle the u32 counter rollover that occurs
+/// after several years of continuous uptime.
+pub fn compute_system_cpu_pct(prev: &[u32; 4], curr: &[u32; 4]) -> f64 {
+    let user   = curr[0].wrapping_sub(prev[0]) as u64;
+    let system = curr[1].wrapping_sub(prev[1]) as u64;
+    let idle   = curr[2].wrapping_sub(prev[2]) as u64;
+    let nice   = curr[3].wrapping_sub(prev[3]) as u64;
+    let total  = user + system + idle + nice;
+    if total == 0 { return 0.0; }
+    ((user + system + nice) as f64 / total as f64) * 100.0
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────

@@ -9,6 +9,7 @@
 //   • Config changes send XPC messages back to the daemon in real time
 
 import SwiftUI
+import Charts
 
 // MARK: - Root View
 
@@ -20,14 +21,34 @@ struct ContentView: View {
             HeaderBar(client: client)
             Divider()
 
-            if let state = client.telemetry {
-                TelemetryTable(state: state)
-            } else {
-                EmptyStateView(isConnected: client.isConnected)
-            }
+            // `disconnected` is true only when we HAVE stale data but lost the
+            // connection (e.g. daemon crashed or was killed by launchd).
+            // When telemetry is nil — the initial state or after a clean exit
+            // (CONNECTION_INVALID clears it) — EmptyStateView handles the empty
+            // state at full opacity and this overlay is not shown.
+            let disconnected = !client.isConnected && client.telemetry != nil
 
-            Divider()
-            ConfigPanel(client: client)
+            ZStack {
+                VStack(spacing: 0) {
+                    if let state = client.telemetry {
+                        TelemetryTable(state: state)
+                    } else {
+                        EmptyStateView(isConnected: client.isConnected)
+                    }
+
+                    Divider()
+                    CpuHistoryChart(history: client.cpuHistory)
+                    Divider()
+                    ConfigPanel(client: client)
+                }
+                .opacity(disconnected ? 0.4 : 1.0)
+                .disabled(disconnected)
+
+                if disconnected {
+                    DisconnectedOverlay()
+                }
+            }
+            .animation(.easeInOut(duration: 0.3), value: disconnected)
         }
         .background(Color(NSColor.windowBackgroundColor))
         // Flexible sizing — NSPanel handles actual window constraints.
@@ -167,6 +188,62 @@ private struct TelemetryTable: View {
     }
 }
 
+// MARK: - CPU History Chart
+
+private struct CpuHistoryChart: View {
+    let history: [Double]
+
+    private struct Sample: Identifiable {
+        let id: Int
+        let value: Double
+    }
+
+    private var samples: [Sample] {
+        history.enumerated().map { Sample(id: $0.offset, value: $0.element) }
+    }
+
+    var body: some View {
+        Chart(samples) { s in
+            AreaMark(
+                x: .value("t", s.id),
+                y: .value("CPU", s.value)
+            )
+            .foregroundStyle(
+                LinearGradient(
+                    colors: [.blue.opacity(0.25), .blue.opacity(0.04)],
+                    startPoint: .top, endPoint: .bottom
+                )
+            )
+            .interpolationMethod(.catmullRom)
+
+            LineMark(
+                x: .value("t", s.id),
+                y: .value("CPU", s.value)
+            )
+            .foregroundStyle(.blue)
+            .lineStyle(StrokeStyle(lineWidth: 1.5))
+            .interpolationMethod(.catmullRom)
+        }
+        .chartYScale(domain: 0...100)
+        .chartXAxis(.hidden)
+        .chartYAxis {
+            AxisMarks(values: [0, 50, 100]) { value in
+                AxisGridLine()
+                AxisValueLabel {
+                    if let v = value.as(Double.self) {
+                        Text("\(Int(v))%")
+                            .font(.system(size: 9))
+                            .foregroundStyle(.secondary)
+                    }
+                }
+            }
+        }
+        .frame(height: 60)
+        .padding(.horizontal, 14)
+        .padding(.vertical, 6)
+    }
+}
+
 // MARK: - Config Panel
 
 private struct ConfigPanel: View {
@@ -275,6 +352,19 @@ private struct TrailingIconLabelStyle: LabelStyle {
             configuration.title
             configuration.icon.imageScale(.small)
         }
+    }
+}
+
+// MARK: - Disconnected Overlay
+
+/// Shown centred over stale content when the XPC connection drops mid-session
+/// (CONNECTION_INTERRUPTED — daemon crashed or launchd killed it).
+/// Deliberately plain: no icon, no colour, no bold weight.
+private struct DisconnectedOverlay: View {
+    var body: some View {
+        Text("Daemon disconnected")
+            .font(.body)
+            .foregroundStyle(.secondary)
     }
 }
 

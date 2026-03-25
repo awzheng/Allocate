@@ -38,7 +38,7 @@ use battery::{get_battery_state, BatteryState};
 use frontmost::{AppSwitchSignal, ForegroundApp};
 use governor::{Governor, GovernorConfig, run_recovery};
 use ipc::IpcBroadcaster;
-use process::{compute_top_cpu, format_ram, get_frontmost_metrics, take_snapshot, CpuSnapshot, ProcessMetrics};
+use process::{compute_system_cpu_pct, compute_top_cpu, format_ram, get_frontmost_metrics, read_host_cpu_ticks, take_snapshot, CpuSnapshot, ProcessMetrics};
 
 // ── Minimal stderr logger ─────────────────────────────────────────────────────
 //
@@ -83,7 +83,9 @@ fn main() {
     // Errors are always shown; set RUST_LOG=debug to see lower-level records
     // if a richer logger is wired in later.
     log::set_logger(&LOGGER).expect("logger already set");
-    log::set_max_level(log::LevelFilter::Error);
+    // Info lets lifecycle events (startup, shutdown) surface on stderr.
+    // Errors from governor.rs are always visible regardless of this level.
+    log::set_max_level(log::LevelFilter::Info);
 
     let args: Vec<String> = std::env::args().collect();
 
@@ -174,6 +176,21 @@ fn main() {
     }
 }
 
+// ── Graceful shutdown ─────────────────────────────────────────────────────────
+
+/// Called from any point in `worker_loop` when the shutdown flag is set.
+///
+/// Fires `taskpolicy -B` on every throttled PID so no app is permanently
+/// stranded on Efficiency cores, then exits with code 0.
+///
+/// Return type `!` (diverges) — the function never returns to its caller.
+fn graceful_shutdown(governor: &mut Governor) -> ! {
+    log::info!("Caught termination signal — releasing all throttled processes and shutting down…");
+    governor.release_all();
+    log::info!("Clean shutdown complete.");
+    std::process::exit(0);
+}
+
 // ── Worker thread ─────────────────────────────────────────────────────────────
 
 fn worker_loop(
@@ -184,33 +201,72 @@ fn worker_loop(
 ) {
     let mut governor = Governor::new(config);
 
-    // Block on the channel. Wakes the instant the OS fires the app-switch
-    // notification — no polling sleep. recv() returns Err when all senders drop.
-    while let Ok(signal) = rx.recv() {
-        // ── Graceful shutdown check ───────────────────────────────────────────
-        // Checked at the top of each cycle so we always release suspended PIDs
-        // before exiting, regardless of which signal arrived.
-        if shutdown.load(Ordering::Relaxed) {
-            println!("[SHUTDOWN] Signal received — releasing all suspended PIDs…");
-            governor.release_all();
-            println!("[SHUTDOWN] Clean exit.");
-            std::process::exit(0);
+    // Wait for the first foreground-app signal, polling the shutdown flag every
+    // 100 ms so a SIGTERM/SIGINT that arrives before any app switch is not missed.
+    let mut fg = loop {
+        match rx.recv_timeout(Duration::from_millis(100)) {
+            Ok(s) => break ForegroundApp { name: s.name, pid: s.pid },
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                if shutdown.load(Ordering::Relaxed) {
+                    graceful_shutdown(&mut governor);
+                }
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => return,
+        }
+    };
+
+    // Track Mach CPU-tick counters across ticks to compute system-wide CPU%.
+    let mut prev_cpu_ticks: Option<[u32; 4]> = None;
+
+    // 1 Hz heartbeat loop. Each iteration:
+    //   1. Drain pending app-switch signals (non-blocking try_recv).
+    //   2. Sample per-process CPU across a 500 ms window.
+    //   3. Diff Mach tick counters for system-wide CPU%.
+    //   4. Run governor, build table, broadcast.
+    //   5. Sleep the remainder of the 1-second tick.
+    loop {
+        let tick_start = Instant::now();
+
+        // ── Graceful shutdown check (top of tick) ────────────────────────────
+        if shutdown.load(Ordering::Relaxed) { graceful_shutdown(&mut governor); }
+
+        // ── Drain any pending app-switch signals (non-blocking) ───────────────
+        while let Ok(signal) = rx.try_recv() {
+            fg = ForegroundApp { name: signal.name, pid: signal.pid };
         }
 
-        let fg = ForegroundApp { name: signal.name, pid: signal.pid };
-
         // ── Two proc_pidinfo snapshots across a 500 ms CPU sampling window ────
+        //
+        // recv_timeout() replaces thread::sleep() so:
+        //   • A SIGINT/SIGTERM during the wait is detected within this tick
+        //     rather than waiting up to 1 s for the next top-of-loop check.
+        //   • An app-switch that arrives mid-sample updates fg immediately.
+        //   • elapsed_ns is the actual measured interval, not a constant,
+        //     so CPU% stays accurate even when recv_timeout returns early.
         let snap1: CpuSnapshot = take_snapshot();
-        let t0 = Instant::now();
-        thread::sleep(CPU_SAMPLE_WINDOW);
+        let sample_t0 = Instant::now();
+        match rx.recv_timeout(CPU_SAMPLE_WINDOW) {
+            Ok(signal) => fg = ForegroundApp { name: signal.name, pid: signal.pid },
+            Err(mpsc::RecvTimeoutError::Disconnected) => return,
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+        }
+        if shutdown.load(Ordering::Relaxed) { graceful_shutdown(&mut governor); }
         let snap2: CpuSnapshot = take_snapshot();
-        let elapsed_ns = t0.elapsed().as_nanos() as u64;
+        let elapsed_ns = sample_t0.elapsed().as_nanos() as u64;
 
+        // ── System-wide CPU% via Mach host_statistics tick diff ───────────────
+        let curr_ticks = read_host_cpu_ticks();
+        let system_cpu = match (&prev_cpu_ticks, &curr_ticks) {
+            (Some(prev), Some(curr)) => compute_system_cpu_pct(prev, curr),
+            _ => 0.0,
+        };
+        prev_cpu_ticks = curr_ticks;
+
+        // ── Per-process hogs + governor ───────────────────────────────────────
         // compute_top_cpu excludes fg.pid so the governor never evaluates it.
         let mut hogs: Vec<ProcessMetrics> =
             compute_top_cpu(&snap1, &snap2, elapsed_ns, Some(fg.pid), TOP_N);
 
-        // ── Active mitigation: apply throttle policy on violators ─────────────
         governor.evaluate(&hogs);
 
         for h in &mut hogs {
@@ -218,8 +274,6 @@ fn worker_loop(
         }
 
         // ── Build display rows ────────────────────────────────────────────────
-        // Frontmost is fetched after evaluate() so the governor never touches
-        // the active app.  It is prepended so build_table renders it as rank 0.
         let mut rows: Vec<ProcessMetrics> = Vec::with_capacity(hogs.len() + 1);
         if let Some(fm) = get_frontmost_metrics(fg.pid, &snap1, &snap2, elapsed_ns) {
             rows.push(fm); // is_frontmost=true, rank 0
@@ -231,7 +285,20 @@ fn worker_loop(
 
         let table = build_table(&fg, &rows, batt.as_ref());
         print!("{}", table);
-        broadcaster.broadcast(&table);
+        broadcaster.broadcast(&table, system_cpu);
+
+        // ── Wait out the remainder of the 1-second tick ──────────────────────
+        // recv_timeout serves as the sleep so a shutdown signal or an app-switch
+        // that arrives during the idle window is acted on immediately.
+        let remaining = Duration::from_secs(1).saturating_sub(tick_start.elapsed());
+        if remaining > Duration::ZERO {
+            match rx.recv_timeout(remaining) {
+                Ok(signal) => fg = ForegroundApp { name: signal.name, pid: signal.pid },
+                Err(mpsc::RecvTimeoutError::Disconnected) => return,
+                Err(mpsc::RecvTimeoutError::Timeout) => {}
+            }
+            if shutdown.load(Ordering::Relaxed) { graceful_shutdown(&mut governor); }
+        }
     }
 }
 

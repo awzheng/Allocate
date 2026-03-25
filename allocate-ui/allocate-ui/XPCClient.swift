@@ -135,6 +135,10 @@ final class XPCClient {
     /// True while the XPC connection to the daemon is alive.
     private(set) var isConnected: Bool = false
 
+    /// Rolling 60-sample buffer of system-wide CPU% values (one per 1 Hz tick).
+    /// Oldest sample is index 0; newest is the last element.
+    private(set) var cpuHistory: [Double] = []
+
     // ── Internals ─────────────────────────────────────────────────────────────
 
     private static let serviceName = "com.andrewzheng.allocate.daemon"
@@ -164,12 +168,14 @@ final class XPCClient {
 
             if type == XPC_TYPE_DICTIONARY {
                 if let rawPtr = xpc_dictionary_get_string(event, "payload") {
-                    let string = String(cString: UnsafePointer(rawPtr))
-                    let parsed = parseTelemetry(string)
+                    let string   = String(cString: UnsafePointer(rawPtr))
+                    let parsed   = parseTelemetry(string)
+                    let sysCpu   = xpc_dictionary_get_double(event, "system_cpu")
                     Task { @MainActor [weak self] in
                         self?.payload = string
                         self?.telemetry = parsed
                         self?.isConnected = true
+                        self?.appendCpuHistory(sysCpu)
                     }
                 }
 
@@ -181,16 +187,11 @@ final class XPCClient {
                     errStr = "<unknown error>"
                 }
                 print("[XPCClient] ERROR: \(errStr)")
-
-                if event === XPC_ERROR_CONNECTION_INTERRUPTED {
-                    Task { @MainActor [weak self] in self?.isConnected = false }
-                } else if event === XPC_ERROR_CONNECTION_INVALID {
-                    Task { @MainActor [weak self] in
-                        self?.isConnected = false
-                        self?.telemetry = nil
-                        self?.payload = nil
-                    }
-                }
+                // Any XPC error means the daemon is unreachable. Mark disconnected
+                // without clearing telemetry — preserved stale data lets the
+                // ContentView overlay condition (!isConnected && telemetry != nil)
+                // evaluate to true and show the ghost UI.
+                Task { @MainActor [weak self] in self?.isConnected = false }
 
             } else {
                 // xpc_copy_description: Create Rule — caller must free().
@@ -212,6 +213,15 @@ final class XPCClient {
         xpc_connection_send_message(conn, ping)
 
         self.connection = conn
+    }
+
+    // MARK: - CPU History
+
+    private func appendCpuHistory(_ value: Double) {
+        cpuHistory.append(value)
+        if cpuHistory.count > 60 {
+            cpuHistory.removeFirst()
+        }
     }
 
     // MARK: - Config
