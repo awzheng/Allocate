@@ -44,6 +44,12 @@ struct SettingsView: View {
             } header: {
                 Text("Manual Overrides")
             }
+
+            Section {
+                Text("Allocate 2026.03 by Andrew Zheng")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
         }
         .formStyle(.grouped)
         .frame(width: 420)
