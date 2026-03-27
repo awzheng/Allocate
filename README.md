@@ -1,10 +1,10 @@
 # Allocate
 
-Control your Mac
+<p align="center"><img src="allocate-site/assets/allocate-window.png" width="500" /></p>
 
-Andrew Zheng 2026
+<p align="center">Control your Mac</p>
 
-<table>
+<table align="center">
   <tr>
     <td><img src="allocate-icons/allocate-icon-01-red.png" width="100" /></td>
     <td><img src="allocate-icons/allocate-icon-02-orange.png" width="100" /></td>
@@ -21,3 +21,5 @@ Andrew Zheng 2026
     <td><img src="allocate-icons/allocate-icon-07-blueberry.png" width="100" /></td>
   </tr>
 </table>
+
+<p align="center">&#169; Andrew Zheng 2026</p>
