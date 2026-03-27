@@ -268,7 +268,7 @@ fn worker_loop(
         let mut hogs: Vec<ProcessMetrics> =
             compute_top_cpu(&snap1, &snap2, elapsed_ns, Some(fg.pid), TOP_N);
 
-        if governor.is_paused() {
+        if !governor.is_enabled() {
             // Standby mode: release any throttled PIDs immediately, then skip
             // evaluation for this tick.  has_throttled() prevents redundant
             // taskpolicy -B spawns every second once the set is already empty.

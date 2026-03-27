@@ -45,10 +45,11 @@ pub struct GovernorConfig {
     /// CPU% below which a currently-throttled process is released.
     /// Must be strictly less than `throttle_threshold` (hysteresis gap).
     pub release_threshold: f64,
-    /// When true the governor is in Standby mode: evaluation is skipped and
+    /// When true the governor actively evaluates and throttles processes.
+    /// When false the governor is in Standby mode: evaluation is skipped and
     /// any currently-throttled PIDs are released.  The 1 Hz telemetry stream
     /// continues uninterrupted so the CPU chart stays live.
-    pub is_paused: bool,
+    pub is_enabled: bool,
     /// PIDs that are always jailed to Efficiency cores, regardless of CPU%.
     pub forced_e_pids: HashSet<i32>,
     /// PIDs that are never jailed — released immediately if currently throttled.
@@ -60,7 +61,7 @@ impl Default for GovernorConfig {
         Self {
             throttle_threshold: 15.0,
             release_threshold:  5.0,
-            is_paused:          false,
+            is_enabled:         true,
             forced_e_pids:      HashSet::new(),
             forced_p_pids:      HashSet::new(),
         }
@@ -180,11 +181,11 @@ impl Governor {
         self.suspended.contains(&pid)
     }
 
-    /// Returns true when the governor is in Standby (paused) mode.
-    /// Reads `is_paused` from the shared config under a brief read-lock.
+    /// Returns true when the governor is actively enabled.
+    /// Reads `is_enabled` from the shared config under a brief read-lock.
     #[inline]
-    pub fn is_paused(&self) -> bool {
-        self.config.read().unwrap_or_else(|e| e.into_inner()).is_paused
+    pub fn is_enabled(&self) -> bool {
+        self.config.read().unwrap_or_else(|e| e.into_inner()).is_enabled
     }
 
     /// Returns true if any PIDs are currently in the throttled set.

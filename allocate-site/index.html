@@ -1,0 +1,75 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Allocate — macOS Core Manager</title>
+  <link rel="stylesheet" href="./dist/output.css" />
+  <style>
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, "SF Pro Display", "SF Pro Text",
+                   "Helvetica Neue", Arial, sans-serif;
+    }
+  </style>
+</head>
+<body class="bg-[#f0f4f8] min-h-screen antialiased overscroll-none">
+
+  <!-- Navbar -->
+  <nav class="sticky top-0 z-50 bg-[#f0f4f8]/80 backdrop-blur-xl border-b border-white/50">
+    <div class="max-w-5xl mx-auto px-6 h-14 flex items-center justify-between">
+      <span class="text-[#1d1d1f] font-semibold text-[17px] tracking-tight">Allocate</span>
+      <a href="#"
+         class="bg-[#0071e3] hover:bg-[#0077ed] active:bg-[#006edb] text-white text-[13px] font-medium
+                px-5 py-[7px] rounded-full transition-colors duration-100 select-none">
+        Download
+      </a>
+    </div>
+  </nav>
+
+  <!-- Hero -->
+  <section class="max-w-5xl mx-auto px-6 pt-24 pb-14 flex flex-col items-center text-center">
+
+    <!-- App Icon -->
+    <img
+      src="assets/app-icon.png"
+      alt="Allocate app icon"
+      class="w-24 h-24 rounded-[22px] shadow-[0_8px_30px_rgba(0,0,0,0.14)] mb-7 select-none pointer-events-none"
+      draggable="false"
+    />
+
+    <!-- Title -->
+    <h1 class="text-[52px] font-bold text-[#1d1d1f] tracking-tight leading-none mb-5">
+      Allocate
+    </h1>
+
+    <!-- Description -->
+    <p class="max-w-[440px] text-[17px] leading-[1.65] text-[#6e6e73]">
+      Take full control of your Mac&rsquo;s CPU core scheduler.
+      Allocate lets you pin any process to efficiency or performance cores,
+      keeping demanding tasks snappy and background work silent with minimal latency.
+    </p>
+
+  </section>
+
+  <!-- Window Screenshot -->
+  <section class="pb-24 flex justify-center">
+    <img
+      src="assets/allocate-window.png"
+      alt="Allocate app window"
+      class="w-full max-w-[560px] rounded-2xl shadow-[0_40px_100px_rgba(0,0,0,0.18)] select-none pointer-events-none"
+      draggable="false"
+    />
+  </section>
+
+  <!-- Footer -->
+  <section class="max-w-5xl mx-auto px-6 pt-24 pb-14 flex flex-col items-center text-center">
+
+    <!-- Description -->
+    <p class="max-w-[440px] text-[17px] leading-[1.65] text-[#6e6e73]">
+      &#169; 2026 Andrew Zheng
+    </p>
+
+  </section>
+
+</body>
+</html>

@@ -149,9 +149,9 @@ final class XPCClient {
     /// Oldest sample is index 0; newest is the last element.
     private(set) var cpuHistory: [Double] = []
 
-    /// Whether the governor is in Standby mode. Writable so SwiftUI Toggles
+    /// Whether the governor is actively enabled. Writable so SwiftUI Toggles
     /// can bind directly via @Bindable. Sends a config message on every change.
-    var isPaused: Bool = false
+    var isEnabled: Bool = true
 
     /// Comma-split list of process names currently in the forced-E override set.
     private(set) var forcedEList: [String] = []
@@ -276,9 +276,9 @@ final class XPCClient {
     /// - Parameters:
     ///   - throttleThreshold: CPU% at which the governor throttles a process.
     ///   - releaseThreshold:  CPU% below which a throttled process is released.
-    ///   - isPaused:          When true the daemon enters Standby mode and
+    ///   - isEnabled:         When false the daemon enters Standby mode and
     ///                        releases all currently-throttled processes.
-    func sendConfig(throttleThreshold: Double, releaseThreshold: Double, isPaused: Bool) {
+    func sendConfig(throttleThreshold: Double, releaseThreshold: Double, isEnabled: Bool) {
         guard let conn = connection else { return }
         // Enforce the hysteresis invariant before sending.
         guard releaseThreshold < throttleThreshold, throttleThreshold > 0 else { return }
@@ -287,7 +287,7 @@ final class XPCClient {
         xpc_dictionary_set_string(msg, "type", "config")
         xpc_dictionary_set_double(msg, "throttle_threshold", throttleThreshold)
         xpc_dictionary_set_double(msg, "release_threshold",  releaseThreshold)
-        xpc_dictionary_set_bool(msg, "is_paused", isPaused)
+        xpc_dictionary_set_bool(msg, "is_enabled", isEnabled)
         xpc_connection_send_message(conn, msg)
         // xpc_release omitted: send_message retains the dict for async delivery.
     }

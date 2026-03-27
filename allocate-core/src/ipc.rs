@@ -281,16 +281,16 @@ fn handle_incoming_message(dict: XpcObjectT, config: &Arc<RwLock<GovernorConfig>
     }
 }
 
-/// Parses `{"type":"config","throttle_threshold":f,"release_threshold":f,"is_paused":b}`
+/// Parses `{"type":"config","throttle_threshold":f,"release_threshold":f,"is_enabled":b}`
 /// and writes the new values into `config`.
 fn handle_config_update(dict: XpcObjectT, config: &Arc<RwLock<GovernorConfig>>) {
     let k_throttle = CString::new("throttle_threshold").unwrap();
     let k_release  = CString::new("release_threshold").unwrap();
-    let k_paused   = CString::new("is_paused").unwrap();
+    let k_enabled  = CString::new("is_enabled").unwrap();
 
-    let throttle  = unsafe { xpc_dictionary_get_double(dict, k_throttle.as_ptr()) };
-    let release   = unsafe { xpc_dictionary_get_double(dict, k_release.as_ptr())  };
-    let is_paused = unsafe { xpc_dictionary_get_bool(dict, k_paused.as_ptr())     };
+    let throttle   = unsafe { xpc_dictionary_get_double(dict, k_throttle.as_ptr()) };
+    let release    = unsafe { xpc_dictionary_get_double(dict, k_release.as_ptr())  };
+    let is_enabled = unsafe { xpc_dictionary_get_bool(dict, k_enabled.as_ptr())    };
 
     // Validate: both positive, release strictly less than throttle.
     if throttle > 0.0 && release > 0.0 && release < throttle {
@@ -298,8 +298,8 @@ fn handle_config_update(dict: XpcObjectT, config: &Arc<RwLock<GovernorConfig>>) 
             Ok(mut cfg) => {
                 cfg.throttle_threshold = throttle;
                 cfg.release_threshold  = release;
-                cfg.is_paused          = is_paused;
-                eprintln!("[IPC] Config updated: throttle={throttle:.1}% release={release:.1}% paused={is_paused}");
+                cfg.is_enabled         = is_enabled;
+                eprintln!("[IPC] Config updated: throttle={throttle:.1}% release={release:.1}% enabled={is_enabled}");
             }
             Err(e) => eprintln!("[IPC] Config write lock poisoned: {e}"),
         }

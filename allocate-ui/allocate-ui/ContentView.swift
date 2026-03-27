@@ -85,8 +85,8 @@ private struct HeaderBar: View {
             }
 
             Spacer()
-            if client.isPaused {
-                Text("PAUSED")
+            if !client.isEnabled {
+                Text("STANDBY")
                     .font(.system(size: 9, weight: .bold))
                     .foregroundStyle(.black)
                     .padding(.horizontal, 5)
@@ -96,7 +96,7 @@ private struct HeaderBar: View {
             }
             ConnectionBadge(isConnected: client.isConnected)
         }
-        .animation(.spring(duration: 0.25), value: client.isPaused)
+        .animation(.spring(duration: 0.25), value: client.isEnabled)
         .padding(.horizontal, 14)
         .padding(.vertical, 10)
     }

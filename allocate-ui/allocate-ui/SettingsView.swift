@@ -18,14 +18,14 @@ struct SettingsView: View {
         @Bindable var bindableClient = client
 
         Form {
+            Section {
+                Toggle("Enable Autonomous Governor", isOn: $bindableClient.isEnabled)
+                    .toggleStyle(.switch)
+            }
+
             Section("Governor Thresholds") {
                 ThresholdRow(label: "Throttle above", value: $throttleThreshold, range: 5...95)
                 ThresholdRow(label: "Release below",  value: $releaseThreshold,  range: 1...90)
-            }
-
-            Section {
-                Toggle("Pause Allocate", isOn: $bindableClient.isPaused)
-                    .toggleStyle(.switch)
             }
 
             Section {
@@ -66,7 +66,7 @@ struct SettingsView: View {
             }
             sendConfig()
         }
-        .onChange(of: client.isPaused) { _, _ in
+        .onChange(of: client.isEnabled) { _, _ in
             sendConfig()
         }
     }
@@ -75,7 +75,7 @@ struct SettingsView: View {
         client.sendConfig(
             throttleThreshold: throttleThreshold,
             releaseThreshold:  releaseThreshold,
-            isPaused:          client.isPaused
+            isEnabled:         client.isEnabled
         )
     }
 }
