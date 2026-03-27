@@ -33,18 +33,26 @@ use crate::process::{take_snapshot, ProcessMetrics};
 
 // ── Public config type ────────────────────────────────────────────────────────
 
-/// Runtime-configurable governor thresholds.
+/// Runtime-configurable governor thresholds and manual PID overrides.
 ///
 /// Shared between the worker thread (reads) and the IPC GCD thread (writes)
 /// via `Arc<RwLock<GovernorConfig>>`.  Reads are non-blocking under no
-/// contention; writes are brief (two f64 assignments).
-#[derive(Debug, Clone, Copy)]
+/// contention; writes are brief.
+#[derive(Debug, Clone)]
 pub struct GovernorConfig {
     /// CPU% at or above which an eligible process is throttled.
     pub throttle_threshold: f64,
     /// CPU% below which a currently-throttled process is released.
     /// Must be strictly less than `throttle_threshold` (hysteresis gap).
     pub release_threshold: f64,
+    /// When true the governor is in Standby mode: evaluation is skipped and
+    /// any currently-throttled PIDs are released.  The 1 Hz telemetry stream
+    /// continues uninterrupted so the CPU chart stays live.
+    pub is_paused: bool,
+    /// PIDs that are always jailed to Efficiency cores, regardless of CPU%.
+    pub forced_e_pids: HashSet<i32>,
+    /// PIDs that are never jailed — released immediately if currently throttled.
+    pub forced_p_pids: HashSet<i32>,
 }
 
 impl Default for GovernorConfig {
@@ -52,6 +60,9 @@ impl Default for GovernorConfig {
         Self {
             throttle_threshold: 15.0,
             release_threshold:  5.0,
+            is_paused:          false,
+            forced_e_pids:      HashSet::new(),
+            forced_p_pids:      HashSet::new(),
         }
     }
 }
@@ -92,31 +103,62 @@ impl Governor {
 
     /// Main evaluation tick — call once per worker-loop iteration.
     ///
-    /// Throttles PIDs above `throttle_threshold` and releases currently-throttled
-    /// PIDs that have fallen below `release_threshold` (hysteresis).
+    /// Priority order (checked before the normal threshold):
+    ///   1. `forced_e_pids` — always jail to E-cores (taskpolicy -b), ignoring CPU%.
+    ///   2. `forced_p_pids` — never jail; release immediately if currently throttled.
+    ///   3. Normal hysteresis — throttle above `throttle_threshold`, release below
+    ///      `release_threshold`.
     pub fn evaluate(&mut self, hogs: &[ProcessMetrics]) {
-        // Snapshot thresholds under a brief read lock.
-        let (throttle_t, release_t) = {
+        // Snapshot config under a brief read lock; clone the sets so we can
+        // release the lock before calling apply_throttle (which spawns a process).
+        let (throttle_t, release_t, forced_e, forced_p) = {
             let cfg = self.config.read().unwrap_or_else(|e| e.into_inner());
-            (cfg.throttle_threshold, cfg.release_threshold)
+            (
+                cfg.throttle_threshold,
+                cfg.release_threshold,
+                cfg.forced_e_pids.clone(),
+                cfg.forced_p_pids.clone(),
+            )
         };
 
-        // ── Throttle newly-hot PIDs ───────────────────────────────────────────
+        // ── Per-hog throttle pass ─────────────────────────────────────────────
         for m in hogs {
+            if forced_e.contains(&m.pid) {
+                // Force E-core: jail immediately regardless of CPU%.
+                if !self.suspended.contains(&m.pid) {
+                    apply_throttle(m.pid, true);
+                    self.suspended.insert(m.pid);
+                }
+                continue;
+            }
+
+            if forced_p.contains(&m.pid) {
+                // Force P-core: release if currently throttled, never re-throttle.
+                if self.suspended.contains(&m.pid) {
+                    apply_throttle(m.pid, false);
+                    self.suspended.remove(&m.pid);
+                }
+                continue;
+            }
+
+            // Normal threshold path.
             if !should_throttle(m, throttle_t) || self.suspended.contains(&m.pid) {
                 continue;
             }
             apply_throttle(m.pid, true);
-            // Insert unconditionally: release_all() will fire taskpolicy -B on
+            // Insert unconditionally: release_all() fires taskpolicy -B on
             // shutdown regardless of spawn success — idempotent and safe.
             self.suspended.insert(m.pid);
         }
 
-        // ── Release PIDs that cooled below the release threshold ──────────────
+        // ── Release pass ──────────────────────────────────────────────────────
         // A PID absent from hogs entirely has effective CPU ≈ 0 < release_t.
+        // forced_p PIDs not seen in hogs are also caught here.
         let to_release: Vec<i32> = self.suspended
             .iter()
             .filter(|&&pid| {
+                if forced_e.contains(&pid) { return false; } // keep jailed
+                if forced_p.contains(&pid) { return true; }  // always release
                 let cpu = hogs.iter()
                     .find(|m| m.pid == pid)
                     .map_or(0.0, |m| m.cpu_pct);
@@ -136,6 +178,30 @@ impl Governor {
     #[inline]
     pub fn is_throttled(&self, pid: i32) -> bool {
         self.suspended.contains(&pid)
+    }
+
+    /// Returns true when the governor is in Standby (paused) mode.
+    /// Reads `is_paused` from the shared config under a brief read-lock.
+    #[inline]
+    pub fn is_paused(&self) -> bool {
+        self.config.read().unwrap_or_else(|e| e.into_inner()).is_paused
+    }
+
+    /// Returns true if any PIDs are currently in the throttled set.
+    /// Used by the worker loop to avoid calling release_all() every tick
+    /// while already in a quiescent standby state.
+    #[inline]
+    pub fn has_throttled(&self) -> bool {
+        !self.suspended.is_empty()
+    }
+
+    /// Returns cloned copies of the forced-E and forced-P PID sets.
+    ///
+    /// Called once per worker tick to annotate hogs and build XPC override lists.
+    /// Acquires the config read-lock once so the caller avoids repeated lock traffic.
+    pub fn forced_pid_sets(&self) -> (HashSet<i32>, HashSet<i32>) {
+        let cfg = self.config.read().unwrap_or_else(|e| e.into_inner());
+        (cfg.forced_e_pids.clone(), cfg.forced_p_pids.clone())
     }
 
     /// Lift the throttle on every suspended PID. Call on clean daemon shutdown.

@@ -1,9 +1,10 @@
 // AllocateApp.swift
-// allocate-ui — Phase 6: SwiftUI Floating HUD Glass
+// allocate-ui — Phase 12.2: Standard macOS App + Native Settings
 //
-// Refactored from MenuBarExtra to a persistent Floating HUD.
-// Uses an NSPanel to float permanently above all other apps, even during
-// app switches, making it perfect for live task monitoring.
+// Converted from a floating NSPanel HUD to a standard, dock-visible macOS app.
+// • WindowGroup: normal resizable window — appears in Dock, standard z-order.
+// • Settings scene: auto-wires Cmd+, and the "Settings…" menu item.
+// • AppDelegate: used only to start the XPC client; no manual window management.
 
 import SwiftUI
 import AppKit
@@ -14,71 +15,26 @@ struct AllocateApp: App {
     @NSApplicationDelegateAdaptor(AppDelegate.self) var appDelegate
 
     var body: some Scene {
-        // We use a Settings scene purely to satisfy the SwiftUI App protocol.
-        // The actual floating window is completely managed by the AppDelegate.
+        WindowGroup {
+            ContentView()
+                .environment(appDelegate.client)
+        }
+        .defaultSize(width: 560, height: 580)
+
         Settings {
-            EmptyView()
+            SettingsView()
+                .environment(appDelegate.client)
         }
     }
 }
 
 @MainActor
 class AppDelegate: NSObject, NSApplicationDelegate {
-    
-    var panel: NSPanel!
-    var client: XPCClient!
+
+    var client: XPCClient = XPCClient()
 
     func applicationDidFinishLaunching(_ notification: Notification) {
-        // Initialize the single source of truth for telemetry.
-        client = XPCClient()
+        NSApp.setActivationPolicy(.regular)
         client.start()
-        
-        let contentView = ContentView()
-            .environment(client)
-
-        // ── Floating NSPanel Configuration ────────────────────────────────────
-        // .nonactivatingPanel allows clicking the HUD without stealing OS focus.
-        // .titled is required for .fullSizeContentView / dragging by background.
-        panel = NSPanel(
-            contentRect: NSRect(x: 0, y: 0, width: 560, height: 580),
-            styleMask: [
-                .titled,
-                .closable,
-                .resizable,
-                .nonactivatingPanel,
-                .fullSizeContentView
-            ],
-            backing: .buffered,
-            defer: false
-        )
-        panel.minSize = NSSize(width: 440, height: 300)
-        
-        // Float persistently over everything
-        panel.level = .floating
-        panel.isFloatingPanel = true
-        
-        // Follow the user across spaces and fullscreen apps
-        panel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
-        
-        // Transparent Apple UI styling: let SwiftUI's .ultraThinMaterial shine
-        panel.titlebarAppearsTransparent = true
-        panel.titleVisibility = .hidden
-        panel.isOpaque = false
-        panel.backgroundColor = .clear
-        panel.isMovableByWindowBackground = true
-        
-        // Wrap the SwiftUI view
-        panel.contentView = NSHostingView(rootView: contentView)
-        
-        // Position top right, below the menu bar
-        if let screen = NSScreen.main {
-            let f = screen.visibleFrame
-            let x = f.maxX - panel.frame.width - 20
-            let y = f.maxY - panel.frame.height - 20
-            panel.setFrameOrigin(NSPoint(x: x, y: y))
-        }
-        
-        panel.makeKeyAndOrderFront(nil)
     }
 }
-

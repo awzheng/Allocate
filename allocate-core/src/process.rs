@@ -133,12 +133,14 @@ pub struct ProcessMetrics {
     pub cpu_pct:        f64,
     pub resident_bytes: u64,
     pub threadnum:      i32,
-    /// Set to true by the governor after evaluate() if this PID is actively
-    /// throttled via taskpolicy. Always false as returned from compute_top_cpu.
-    pub is_throttled:   bool,
+    /// Set to true by the worker loop if this PID is auto-throttled by the governor.
+    pub is_throttled:  bool,
     /// Set to true for the frontmost (active foreground) PID row.
-    /// Always false as returned from compute_top_cpu; set by the worker loop.
-    pub is_frontmost:   bool,
+    pub is_frontmost:  bool,
+    /// Set to true by the worker loop if this PID is in the forced-E override set.
+    pub is_forced_e:   bool,
+    /// Set to true by the worker loop if this PID is in the forced-P override set.
+    pub is_forced_p:   bool,
 }
 
 // ── Public formatting helper ──────────────────────────────────────────────────
@@ -348,8 +350,10 @@ pub fn compute_top_cpu(
                     cpu_pct:        pct,
                     resident_bytes: *resident_bytes,
                     threadnum:      *threadnum,
-                    is_throttled:   false, // annotated by Governor::evaluate()
-                    is_frontmost:   false, // annotated by the worker loop
+                    is_throttled:   false,
+                    is_frontmost:   false,
+                    is_forced_e:    false,
+                    is_forced_p:    false,
                 })
             } else {
                 None
@@ -394,6 +398,8 @@ pub fn get_frontmost_metrics(
         threadnum:      *threadnum,
         is_throttled:   false,
         is_frontmost:   true,
+        is_forced_e:    false,
+        is_forced_p:    false,
     })
 }
 

@@ -75,6 +75,11 @@ extern "C" {
         key:   *const libc::c_char,
         value: f64,
     );
+    /// Returns false if the key is absent or not a bool.
+    fn xpc_dictionary_get_bool(
+        xdict: XpcObjectT,
+        key:   *const libc::c_char,
+    ) -> bool;
 
     fn xpc_connection_send_message(connection: XpcObjectT, message: XpcObjectT);
     fn dispatch_get_global_queue(identifier: libc::c_long, flags: libc::c_ulong)
@@ -100,7 +105,13 @@ pub struct IpcBroadcaster {
 }
 
 impl IpcBroadcaster {
-    pub fn broadcast(&self, payload: &str, system_cpu: f64) {
+    /// Broadcast a telemetry tick to all connected UI clients.
+    ///
+    /// - `payload`     — the brutalist ASCII table string
+    /// - `system_cpu`  — system-wide CPU% for the rolling chart
+    /// - `override_e`  — comma-separated names of forced-E-core PIDs (may be empty)
+    /// - `override_p`  — comma-separated names of forced-P-core PIDs (may be empty)
+    pub fn broadcast(&self, payload: &str, system_cpu: f64, override_e: &str, override_p: &str) {
         let clients = match self.clients.lock() {
             Ok(g)  => g,
             Err(_) => return,
@@ -112,14 +123,23 @@ impl IpcBroadcaster {
             Ok(s)  => s,
             Err(_) => return,
         };
+        // Override lists are already sanitised (process names from the OS); replace
+        // any stray NUL bytes defensively before wrapping in a CString.
+        let e_cstr = CString::new(override_e.replace('\0', "?")).unwrap_or_default();
+        let p_cstr = CString::new(override_p.replace('\0', "?")).unwrap_or_default();
+
         let key_payload    = CString::new("payload").expect("static string");
         let key_system_cpu = CString::new("system_cpu").expect("static string");
+        let key_override_e = CString::new("override_e_list").expect("static string");
+        let key_override_p = CString::new("override_p_list").expect("static string");
 
         unsafe {
             let msg = xpc_dictionary_create_empty();
             if msg.is_null() { return; }
             xpc_dictionary_set_string(msg, key_payload.as_ptr(), payload_cstr.as_ptr());
             xpc_dictionary_set_double(msg, key_system_cpu.as_ptr(), system_cpu);
+            xpc_dictionary_set_string(msg, key_override_e.as_ptr(), e_cstr.as_ptr());
+            xpc_dictionary_set_string(msg, key_override_p.as_ptr(), p_cstr.as_ptr());
             for client in clients.iter() {
                 xpc_connection_send_message(client.0, msg);
             }
@@ -217,8 +237,8 @@ unsafe fn create_listener(
                 }
 
             } else if unsafe { event_type == &_xpc_type_dictionary as *const c_void } {
-                // ── Incoming message — check for config update ────────────────
-                handle_config_message(event_ptr, &config_for_client);
+                // ── Incoming message — dispatch by type ───────────────────────
+                handle_incoming_message(event_ptr, &config_for_client);
             }
         });
 
@@ -243,25 +263,34 @@ unsafe fn create_listener(
     listener
 }
 
-/// Parses a `{"type":"config","throttle_threshold":f,"release_threshold":f}`
-/// dictionary and writes the new values into `config`.
+/// Top-level incoming-message dispatcher.
 ///
-/// Silently ignores malformed or non-config messages.
-fn handle_config_message(dict: XpcObjectT, config: &Arc<RwLock<GovernorConfig>>) {
-    // All C-string keys are static — unwrap is safe.
-    let k_type     = CString::new("type").unwrap();
-    let k_throttle = CString::new("throttle_threshold").unwrap();
-    let k_release  = CString::new("release_threshold").unwrap();
-
+/// Reads the `"type"` key and routes to the appropriate handler.
+/// Silently ignores messages with an absent or unknown type.
+fn handle_incoming_message(dict: XpcObjectT, config: &Arc<RwLock<GovernorConfig>>) {
+    let k_type   = CString::new("type").unwrap();
     // SAFETY: dict is a live xpc_object_t (type confirmed by caller).
-    // xpc_dictionary_get_string returns a ptr into dict's storage — valid here.
     let type_ptr = unsafe { xpc_dictionary_get_string(dict, k_type.as_ptr()) };
     if type_ptr.is_null() { return; }
     let type_str = unsafe { CStr::from_ptr(type_ptr).to_str().unwrap_or("") };
-    if type_str != "config" { return; }
 
-    let throttle = unsafe { xpc_dictionary_get_double(dict, k_throttle.as_ptr()) };
-    let release  = unsafe { xpc_dictionary_get_double(dict, k_release.as_ptr())  };
+    match type_str {
+        "config"   => handle_config_update(dict, config),
+        "override" => handle_pid_override(dict, config),
+        _          => {}
+    }
+}
+
+/// Parses `{"type":"config","throttle_threshold":f,"release_threshold":f,"is_paused":b}`
+/// and writes the new values into `config`.
+fn handle_config_update(dict: XpcObjectT, config: &Arc<RwLock<GovernorConfig>>) {
+    let k_throttle = CString::new("throttle_threshold").unwrap();
+    let k_release  = CString::new("release_threshold").unwrap();
+    let k_paused   = CString::new("is_paused").unwrap();
+
+    let throttle  = unsafe { xpc_dictionary_get_double(dict, k_throttle.as_ptr()) };
+    let release   = unsafe { xpc_dictionary_get_double(dict, k_release.as_ptr())  };
+    let is_paused = unsafe { xpc_dictionary_get_bool(dict, k_paused.as_ptr())     };
 
     // Validate: both positive, release strictly less than throttle.
     if throttle > 0.0 && release > 0.0 && release < throttle {
@@ -269,9 +298,52 @@ fn handle_config_message(dict: XpcObjectT, config: &Arc<RwLock<GovernorConfig>>)
             Ok(mut cfg) => {
                 cfg.throttle_threshold = throttle;
                 cfg.release_threshold  = release;
-                eprintln!("[IPC] Config updated: throttle={throttle:.1}% release={release:.1}%");
+                cfg.is_paused          = is_paused;
+                eprintln!("[IPC] Config updated: throttle={throttle:.1}% release={release:.1}% paused={is_paused}");
             }
             Err(e) => eprintln!("[IPC] Config write lock poisoned: {e}"),
         }
+    }
+}
+
+/// Parses `{"type":"override","override_pid":<f64>,"override_action":<str>}` and
+/// updates the forced-E / forced-P sets in `config`.
+///
+/// `override_pid` is sent as a double from Swift (avoids a new XPC type binding).
+/// Valid actions: "force_e", "force_p", "clear".
+fn handle_pid_override(dict: XpcObjectT, config: &Arc<RwLock<GovernorConfig>>) {
+    let k_pid    = CString::new("override_pid").unwrap();
+    let k_action = CString::new("override_action").unwrap();
+
+    let pid_f64 = unsafe { xpc_dictionary_get_double(dict, k_pid.as_ptr()) };
+    let pid = pid_f64 as i32;
+    if pid <= 0 { return; }
+
+    let action_ptr = unsafe { xpc_dictionary_get_string(dict, k_action.as_ptr()) };
+    if action_ptr.is_null() { return; }
+    let action = unsafe { CStr::from_ptr(action_ptr).to_str().unwrap_or("") };
+
+    match config.write() {
+        Ok(mut cfg) => {
+            match action {
+                "force_e" => {
+                    cfg.forced_p_pids.remove(&pid); // clear conflicting override
+                    cfg.forced_e_pids.insert(pid);
+                    eprintln!("[IPC] Override: PID {pid} → force_e");
+                }
+                "force_p" => {
+                    cfg.forced_e_pids.remove(&pid); // clear conflicting override
+                    cfg.forced_p_pids.insert(pid);
+                    eprintln!("[IPC] Override: PID {pid} → force_p");
+                }
+                "clear" => {
+                    cfg.forced_e_pids.remove(&pid);
+                    cfg.forced_p_pids.remove(&pid);
+                    eprintln!("[IPC] Override: PID {pid} → cleared");
+                }
+                _ => {}
+            }
+        }
+        Err(e) => eprintln!("[IPC] Config write lock poisoned: {e}"),
     }
 }

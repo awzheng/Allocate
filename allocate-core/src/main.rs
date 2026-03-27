@@ -26,6 +26,7 @@ mod governor;
 mod ipc;
 mod process;
 
+use std::collections::HashSet;
 use std::sync::mpsc;
 use std::sync::{Arc, RwLock, atomic::{AtomicBool, Ordering}};
 use std::thread;
@@ -267,11 +268,29 @@ fn worker_loop(
         let mut hogs: Vec<ProcessMetrics> =
             compute_top_cpu(&snap1, &snap2, elapsed_ns, Some(fg.pid), TOP_N);
 
-        governor.evaluate(&hogs);
+        if governor.is_paused() {
+            // Standby mode: release any throttled PIDs immediately, then skip
+            // evaluation for this tick.  has_throttled() prevents redundant
+            // taskpolicy -B spawns every second once the set is already empty.
+            if governor.has_throttled() {
+                governor.release_all();
+            }
+        } else {
+            governor.evaluate(&hogs);
+        }
 
+        // ── Annotate hogs with governor state ─────────────────────────────────
+        // forced_pid_sets() takes one read-lock; avoids per-hog lock churn.
+        let (forced_e, forced_p) = governor.forced_pid_sets();
         for h in &mut hogs {
             h.is_throttled = governor.is_throttled(h.pid);
+            h.is_forced_e  = forced_e.contains(&h.pid);
+            h.is_forced_p  = forced_p.contains(&h.pid);
         }
+
+        // Build comma-separated name strings for the XPC override lists.
+        let e_names = build_override_list(&forced_e, &snap2);
+        let p_names = build_override_list(&forced_p, &snap2);
 
         // ── Build display rows ────────────────────────────────────────────────
         let mut rows: Vec<ProcessMetrics> = Vec::with_capacity(hogs.len() + 1);
@@ -285,7 +304,7 @@ fn worker_loop(
 
         let table = build_table(&fg, &rows, batt.as_ref());
         print!("{}", table);
-        broadcaster.broadcast(&table, system_cpu);
+        broadcaster.broadcast(&table, system_cpu, &e_names, &p_names);
 
         // ── Wait out the remainder of the 1-second tick ──────────────────────
         // recv_timeout serves as the sleep so a shutdown signal or an app-switch
@@ -310,6 +329,19 @@ fn print_banner() {
     println!("  CPU window: 500 ms  |  Top N: {}  |  Event-driven + XPC  ", TOP_N);
     println!("═══════════════════════════════════════════════════════════");
     println!("[INIT] Watchdog armed. Waiting for foreground change…\n");
+}
+
+/// Builds a comma-separated string of process names for each PID in `pids`.
+/// Looks up names from the latest CPU snapshot; falls back to the PID string
+/// if the process has exited between the snapshot and this call.
+fn build_override_list(pids: &HashSet<i32>, snap: &CpuSnapshot) -> String {
+    if pids.is_empty() { return String::new(); }
+    pids.iter()
+        .map(|pid| snap.get(pid)
+            .map(|(name, _, _, _, _)| name.as_str())
+            .unwrap_or("?"))
+        .collect::<Vec<_>>()
+        .join(",")
 }
 
 /// Builds the brutalist ASCII table as a String.
@@ -350,8 +382,8 @@ fn build_table(
         let ram  = format_ram(fm.resident_bytes);
         let name = if fm.name.len() > 24 { &fm.name[..24] } else { &fm.name };
         out.push_str(&format!(
-            "│ {:>2}. {:<24} | CPU: {:>5.1}% | RAM: {:>6} | Threads: {} | FRONTMOST\n",
-            0, name, fm.cpu_pct, ram, fm.threadnum,
+            "│ {:>2}. {:<24} | PID: {:>5} | CPU: {:>5.1}% | RAM: {:>6} | Threads: {} | FRONTMOST\n",
+            0, name, fm.pid, fm.cpu_pct, ram, fm.threadnum,
         ));
         out.push_str(&format!("├{SEP}\n"));
     }
@@ -364,10 +396,13 @@ fn build_table(
         for (i, h) in hogs.iter().enumerate() {
             let ram  = format_ram(h.resident_bytes);
             let name = if h.name.len() > 24 { &h.name[..24] } else { &h.name };
-            let tag  = if h.is_throttled { "THROTTLED" } else { "OK" };
+            let tag = if      h.is_forced_e  { "FORCE_E"   }
+                      else if h.is_forced_p  { "FORCE_P"   }
+                      else if h.is_throttled { "THROTTLED" }
+                      else                   { "OK"        };
             out.push_str(&format!(
-                "│ {:>2}. {:<24} | CPU: {:>5.1}% | RAM: {:>6} | Threads: {} | {}\n",
-                i + 1, name, h.cpu_pct, ram, h.threadnum, tag,
+                "│ {:>2}. {:<24} | PID: {:>5} | CPU: {:>5.1}% | RAM: {:>6} | Threads: {} | {}\n",
+                i + 1, name, h.pid, h.cpu_pct, ram, h.threadnum, tag,
             ));
         }
     }

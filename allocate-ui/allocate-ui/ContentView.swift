@@ -38,8 +38,6 @@ struct ContentView: View {
 
                     Divider()
                     CpuHistoryChart(history: client.cpuHistory)
-                    Divider()
-                    ConfigPanel(client: client)
                 }
                 .opacity(disconnected ? 0.4 : 1.0)
                 .disabled(disconnected)
@@ -87,8 +85,18 @@ private struct HeaderBar: View {
             }
 
             Spacer()
+            if client.isPaused {
+                Text("PAUSED")
+                    .font(.system(size: 9, weight: .bold))
+                    .foregroundStyle(.black)
+                    .padding(.horizontal, 5)
+                    .padding(.vertical, 2)
+                    .background(Color.yellow.opacity(0.85), in: Capsule())
+                    .transition(.opacity.combined(with: .scale(scale: 0.8)))
+            }
             ConnectionBadge(isConnected: client.isConnected)
         }
+        .animation(.spring(duration: 0.25), value: client.isPaused)
         .padding(.horizontal, 14)
         .padding(.vertical, 10)
     }
@@ -98,7 +106,9 @@ private struct HeaderBar: View {
 
 private struct TelemetryTable: View {
     let state: TelemetryState
+    @Environment(XPCClient.self) private var client
     @State private var sortOrder = [KeyPathComparator(\ProcessMetrics.id)]
+    @State private var selection: Set<ProcessMetrics.ID> = []
 
     /// The frontmost row is pinned first; background hogs follow sorted by
     /// the user's chosen column.  The frontmost row carries real CPU/RAM/threads
@@ -111,7 +121,7 @@ private struct TelemetryTable: View {
     }
 
     var body: some View {
-        Table(displayRows, sortOrder: $sortOrder) {
+        Table(displayRows, selection: $selection, sortOrder: $sortOrder) {
             TableColumn("#", value: \.id) { row in
                 Text(row.isForeground ? "▶" : "\(row.id)")
                     .font(.body.monospacedDigit())
@@ -126,9 +136,13 @@ private struct TelemetryTable: View {
                         .lineLimit(1)
                         .foregroundStyle(nameColor(for: row))
                     if row.isForeground {
-                        badge("IN FOCUS", color: .blue)
+                        badge("IN FOCUS",  color: .blue)
+                    } else if row.isForcedE {
+                        badge("MANUAL E",  color: .purple)
+                    } else if row.isForcedP {
+                        badge("MANUAL P",  color: .green)
                     } else if row.isThrottled {
-                        badge("THROTTLED", color: .orange)
+                        badge("AUTO E",    color: .orange)
                     }
                 }
             }
@@ -160,6 +174,20 @@ private struct TelemetryTable: View {
         }
         .tableStyle(.inset(alternatesRowBackgrounds: true))
         .animation(.easeInOut(duration: 0.2), value: state.processes.map(\.name))
+        .contextMenu(forSelectionType: ProcessMetrics.ID.self) { ids in
+            if let id = ids.first, let row = displayRows.first(where: { $0.id == id }) {
+                Button("Force E-Core (Throttle)") {
+                    client.sendOverride(pid: row.pid, action: "force_e")
+                }
+                Button("Force P-Core (Whitelist)") {
+                    client.sendOverride(pid: row.pid, action: "force_p")
+                }
+                Divider()
+                Button("Clear Override") {
+                    client.sendOverride(pid: row.pid, action: "clear")
+                }
+            }
+        }
     }
 
     @ViewBuilder
@@ -174,6 +202,8 @@ private struct TelemetryTable: View {
 
     private func nameColor(for row: ProcessMetrics) -> Color {
         if row.isForeground { return .blue }
+        if row.isForcedE    { return .purple }
+        if row.isForcedP    { return .green }
         if row.isThrottled  { return .orange }
         return .primary
     }
@@ -241,91 +271,6 @@ private struct CpuHistoryChart: View {
         .frame(height: 60)
         .padding(.horizontal, 14)
         .padding(.vertical, 6)
-    }
-}
-
-// MARK: - Config Panel
-
-private struct ConfigPanel: View {
-    let client: XPCClient
-
-    // Local state — initialised to daemon defaults (15 / 5).
-    @State private var throttleThreshold: Double = 15.0
-    @State private var releaseThreshold:  Double = 5.0
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: 6) {
-            Text("GOVERNOR THRESHOLDS")
-                .font(.system(size: 10, weight: .semibold))
-                .foregroundStyle(.secondary)
-                .kerning(0.8)
-
-            ThresholdRow(label: "Throttle above", value: $throttleThreshold, range: 5...95)
-            ThresholdRow(label: "Release below",  value: $releaseThreshold,  range: 1...90)
-        }
-        .padding(.horizontal, 14)
-        .padding(.vertical, 10)
-        // Send on every change, but enforce the hysteresis invariant first.
-        .onChange(of: throttleThreshold) { _, new in
-            // If the user pushes throttle down to or below release, nudge release down.
-            if releaseThreshold >= new {
-                releaseThreshold = max(1, new - 1)
-            }
-            sendConfig()
-        }
-        .onChange(of: releaseThreshold) { _, new in
-            // If the user pushes release up to or above throttle, nudge throttle up.
-            if throttleThreshold <= new {
-                throttleThreshold = min(95, new + 1)
-            }
-            sendConfig()
-        }
-    }
-
-    private func sendConfig() {
-        client.sendConfig(
-            throttleThreshold: throttleThreshold,
-            releaseThreshold:  releaseThreshold
-        )
-    }
-}
-
-private struct ThresholdRow: View {
-    let label: String
-    @Binding var value: Double
-    let range: ClosedRange<Double>
-
-    @State private var text: String = ""
-
-    var body: some View {
-        HStack(spacing: 8) {
-            Text(label)
-                .font(.system(size: 12))
-                .foregroundStyle(.secondary)
-                .frame(width: 110, alignment: .leading)
-
-            Slider(value: $value, in: range, step: 5.0)
-                .onChange(of: value) { _, new in
-                    text = String(format: "%.0f", new)
-                }
-
-            TextField("", text: $text)
-                .font(.system(size: 12).monospacedDigit())
-                .multilineTextAlignment(.trailing)
-                .frame(width: 46)
-                .onSubmit {
-                    if let d = Double(text), range.contains(d) {
-                        value = d
-                    } else {
-                        text = String(format: "%.0f", value)
-                    }
-                }
-
-            Text("%")
-                .font(.system(size: 12))
-                .foregroundStyle(.secondary)
-        }
-        .onAppear { text = String(format: "%.0f", value) }
     }
 }
 

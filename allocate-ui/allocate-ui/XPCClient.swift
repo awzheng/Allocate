@@ -27,13 +27,16 @@ import Foundation
 // MARK: - Data Models
 
 struct ProcessMetrics: Identifiable {
-    let id: Int           // process rank (1-based); 0 = synthetic foreground row
+    let id: Int            // process rank (1-based); 0 = synthetic foreground row
+    let pid: Int32         // actual macOS process ID — used for XPC override commands
     let name: String
-    let cpu: String       // e.g. "  5.1%" or "—" for the foreground row
-    let ram: String       // e.g. " 120 MB" or "—"
-    let threads: String   // e.g. "8" or "—"
-    let isThrottled: Bool // true when the governor has applied taskpolicy -b
-    let isForeground: Bool // true for the synthetic pinned foreground row
+    let cpu: String        // e.g. "  5.1%"
+    let ram: String        // e.g. " 120 MB"
+    let threads: String    // e.g. "8"
+    let isForeground: Bool // true for the frontmost app row
+    let isThrottled: Bool  // true when auto-throttled by the governor
+    let isForcedE: Bool    // true when manually jailed to E-cores
+    let isForcedP: Bool    // true when manually whitelisted on P-cores
 }
 
 struct TelemetryState {
@@ -52,8 +55,8 @@ struct TelemetryState {
 ///   │ 🟢 ACTIVE: AppName (PID: 12345) | 🔋 100% (Battery)
 ///   ├──...
 ///   │ ⚠️  BACKGROUND HOGS
-///   │  1. ProcessName             | CPU:   5.1% | RAM:  120 MB | Threads: 8 | OK
-///   │  2. HogProcess              | CPU:  42.0% | RAM:  800 MB | Threads: 4 | THROTTLED
+///   │  1. ProcessName             | PID:  1234 | CPU:   5.1% | RAM:  120 MB | Threads: 8 | OK
+///   │  2. HogProcess              | PID:  5678 | CPU:  42.0% | RAM:  800 MB | Threads: 4 | THROTTLED
 ///   └──...
 private func parseTelemetry(_ payload: String) -> TelemetryState {
     var state = TelemetryState()
@@ -81,10 +84,10 @@ private func parseTelemetry(_ payload: String) -> TelemetryState {
         }
 
         // ── Process row ─────────────────────────────────────────────────────
-        // "1. ProcessName             | CPU:   5.1% | RAM:  120 MB | Threads: 8 | OK"
-        // "2. HogProcess              | CPU:  42.0% | RAM:  800 MB | Threads: 4 | THROTTLED"
+        // "1. ProcessName  | PID:  1234 | CPU:   5.1% | RAM:  120 MB | Threads: 8 | OK"
+        // "2. HogProcess   | PID:  5678 | CPU:  42.0% | RAM:  800 MB | Threads: 4 | THROTTLED"
         let parts = content.components(separatedBy: " | ")
-        guard parts.count == 5 else { continue }
+        guard parts.count == 6 else { continue }
 
         // parts[0] = "1. ProcessName   "
         let namePart = parts[0]
@@ -93,27 +96,34 @@ private func parseTelemetry(_ payload: String) -> TelemetryState {
             .trimmingCharacters(in: .whitespaces)
         guard !name.isEmpty, name != "⚠️  BACKGROUND HOGS" else { continue }
 
-        // parts[1] = "CPU:   5.1%"
-        let cpu = parts[1].replacingOccurrences(of: "CPU:", with: "")
+        // parts[1] = "PID:  1234"
+        let pid = Int32(parts[1].replacingOccurrences(of: "PID:", with: "")
+            .trimmingCharacters(in: .whitespaces)) ?? 0
+
+        // parts[2] = "CPU:   5.1%"
+        let cpu = parts[2].replacingOccurrences(of: "CPU:", with: "")
             .trimmingCharacters(in: .whitespaces)
 
-        // parts[2] = "RAM:  120 MB"
-        let ram = parts[2].replacingOccurrences(of: "RAM:", with: "")
+        // parts[3] = "RAM:  120 MB"
+        let ram = parts[3].replacingOccurrences(of: "RAM:", with: "")
             .trimmingCharacters(in: .whitespaces)
 
-        // parts[3] = "Threads: 8"
-        let threads = parts[3].replacingOccurrences(of: "Threads:", with: "")
+        // parts[4] = "Threads: 8"
+        let threads = parts[4].replacingOccurrences(of: "Threads:", with: "")
             .trimmingCharacters(in: .whitespaces)
 
-        // parts[4] = "FRONTMOST" | "THROTTLED" | "OK"
-        let tag = parts[4].trimmingCharacters(in: .whitespaces)
+        // parts[5] = "FRONTMOST" | "THROTTLED" | "FORCE_E" | "FORCE_P" | "OK"
+        let tag         = parts[5].trimmingCharacters(in: .whitespaces)
         let isForeground = tag == "FRONTMOST"
         let isThrottled  = tag == "THROTTLED"
+        let isForcedE    = tag == "FORCE_E"
+        let isForcedP    = tag == "FORCE_P"
 
         rank += 1
         state.processes.append(ProcessMetrics(
-            id: rank, name: name, cpu: cpu, ram: ram, threads: threads,
-            isThrottled: isThrottled, isForeground: isForeground
+            id: rank, pid: pid, name: name, cpu: cpu, ram: ram, threads: threads,
+            isForeground: isForeground, isThrottled: isThrottled,
+            isForcedE: isForcedE, isForcedP: isForcedP
         ))
     }
 
@@ -139,6 +149,16 @@ final class XPCClient {
     /// Oldest sample is index 0; newest is the last element.
     private(set) var cpuHistory: [Double] = []
 
+    /// Whether the governor is in Standby mode. Writable so SwiftUI Toggles
+    /// can bind directly via @Bindable. Sends a config message on every change.
+    var isPaused: Bool = false
+
+    /// Comma-split list of process names currently in the forced-E override set.
+    private(set) var forcedEList: [String] = []
+
+    /// Comma-split list of process names currently in the forced-P override set.
+    private(set) var forcedPList: [String] = []
+
     // ── Internals ─────────────────────────────────────────────────────────────
 
     private static let serviceName = "com.andrewzheng.allocate.daemon"
@@ -147,6 +167,10 @@ final class XPCClient {
     /// nonisolated ObservationTracked backing — illegal for mutable state on a
     /// @MainActor class under Swift 6. nonisolated is intentionally absent.
     @ObservationIgnored private var connection: xpc_connection_t? = nil
+
+    /// Counts incoming 1 Hz ticks. The telemetry table is refreshed every 3rd
+    /// tick to prevent the list from jumping; the CPU graph always updates.
+    @ObservationIgnored private var tickCount = 0
 
     // ── Lifecycle ─────────────────────────────────────────────────────────────
 
@@ -167,22 +191,40 @@ final class XPCClient {
             let type = xpc_get_type(event)
 
             if type == XPC_TYPE_DICTIONARY {
-                if let rawPtr = xpc_dictionary_get_string(event, "payload") {
-                    let string   = String(cString: UnsafePointer(rawPtr))
-                    let parsed   = parseTelemetry(string)
-                    let sysCpu   = xpc_dictionary_get_double(event, "system_cpu")
-                    Task { @MainActor [weak self] in
-                        self?.payload = string
-                        self?.telemetry = parsed
-                        self?.isConnected = true
-                        self?.appendCpuHistory(sysCpu)
+                guard let rawPtr = xpc_dictionary_get_string(event, "payload") else { return }
+                let string  = String(cString: rawPtr)
+                let parsed  = parseTelemetry(string)
+                let sysCpu  = xpc_dictionary_get_double(event, "system_cpu")
+
+                // Override lists: parse on the XPC thread before hopping to MainActor.
+                let eListStr = xpc_dictionary_get_string(event, "override_e_list")
+                    .map { String(cString: $0) } ?? ""
+                let pListStr = xpc_dictionary_get_string(event, "override_p_list")
+                    .map { String(cString: $0) } ?? ""
+                let parsedEList = eListStr.isEmpty ? [] : eListStr.components(separatedBy: ",")
+                let parsedPList = pListStr.isEmpty ? [] : pListStr.components(separatedBy: ",")
+
+                Task { @MainActor [weak self] in
+                    guard let self else { return }
+                    self.isConnected = true
+                    // Graph always updates at 1 Hz for a perfectly smooth chart.
+                    self.appendCpuHistory(sysCpu)
+                    // Override lists update every tick (changes are user-triggered).
+                    self.forcedEList = parsedEList
+                    self.forcedPList = parsedPList
+                    // Table updates every 3rd tick to suppress visual jitter from
+                    // CPU% fluctuations re-sorting rows while the user is reading.
+                    self.tickCount += 1
+                    if self.tickCount % 3 == 0 {
+                        self.payload  = string
+                        self.telemetry = parsed
                     }
                 }
 
             } else if type == XPC_TYPE_ERROR {
                 let errStr: String
                 if let rawPtr = xpc_dictionary_get_string(event, "XPCErrorDescription") {
-                    errStr = String(cString: UnsafePointer(rawPtr))
+                    errStr = String(cString: rawPtr)
                 } else {
                     errStr = "<unknown error>"
                 }
@@ -196,7 +238,7 @@ final class XPCClient {
             } else {
                 // xpc_copy_description: Create Rule — caller must free().
                 let rawPtr = xpc_copy_description(event)
-                let desc = String(cString: UnsafePointer(rawPtr))
+                let desc = String(cString: rawPtr)
                 free(rawPtr)
                 print("[XPCClient] Unknown event: \(desc)")
             }
@@ -226,7 +268,7 @@ final class XPCClient {
 
     // MARK: - Config
 
-    /// Sends updated governor thresholds to the daemon.
+    /// Sends updated governor config to the daemon.
     ///
     /// Fire-and-forget: the daemon's GCD XPC handler writes the new values into
     /// its Arc<RwLock<GovernorConfig>> asynchronously.  No response is expected.
@@ -234,7 +276,9 @@ final class XPCClient {
     /// - Parameters:
     ///   - throttleThreshold: CPU% at which the governor throttles a process.
     ///   - releaseThreshold:  CPU% below which a throttled process is released.
-    func sendConfig(throttleThreshold: Double, releaseThreshold: Double) {
+    ///   - isPaused:          When true the daemon enters Standby mode and
+    ///                        releases all currently-throttled processes.
+    func sendConfig(throttleThreshold: Double, releaseThreshold: Double, isPaused: Bool) {
         guard let conn = connection else { return }
         // Enforce the hysteresis invariant before sending.
         guard releaseThreshold < throttleThreshold, throttleThreshold > 0 else { return }
@@ -243,7 +287,29 @@ final class XPCClient {
         xpc_dictionary_set_string(msg, "type", "config")
         xpc_dictionary_set_double(msg, "throttle_threshold", throttleThreshold)
         xpc_dictionary_set_double(msg, "release_threshold",  releaseThreshold)
+        xpc_dictionary_set_bool(msg, "is_paused", isPaused)
         xpc_connection_send_message(conn, msg)
         // xpc_release omitted: send_message retains the dict for async delivery.
+    }
+
+    // MARK: - Override
+
+    /// Sends a manual core-assignment override for a specific PID.
+    ///
+    /// - Parameters:
+    ///   - pid:    The process ID to override.
+    ///   - action: One of "force_e" (jail to E-cores), "force_p" (whitelist on
+    ///             P-cores), or "clear" (remove any existing override).
+    func sendOverride(pid: Int32, action: String) {
+        guard let conn = connection else { return }
+        let msg = xpc_dictionary_create(nil, nil, 0)
+        xpc_dictionary_set_string(msg, "type", "override")
+        xpc_dictionary_set_double(msg, "override_pid", Double(pid))
+        // withCString guarantees a non-optional UnsafePointer<CChar> for the
+        // call duration; xpc_dictionary_set_string copies it before returning.
+        action.withCString { cStr in
+            xpc_dictionary_set_string(msg, "override_action", cStr)
+        }
+        xpc_connection_send_message(conn, msg)
     }
 }
