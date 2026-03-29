@@ -4,7 +4,7 @@
 
 <p align="center">Control your Mac</p>
 
-<table align="center">
+<table align="center" border="0">
   <tr>
     <td><img src="allocate-icons/allocate-icon-01-red.png" width="100" /></td>
     <td><img src="allocate-icons/allocate-icon-02-orange.png" width="100" /></td>
