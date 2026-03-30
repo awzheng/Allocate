@@ -18,11 +18,19 @@
   <nav class="sticky top-0 z-50 bg-[#f0f4f8]/80 backdrop-blur-xl border-b border-white/50">
     <div class="max-w-5xl mx-auto px-6 h-14 flex items-center justify-between">
       <span class="text-[#1d1d1f] font-semibold text-[17px] tracking-tight">Allocate</span>
-      <a href="https://github.com/awzheng/Allocate/releases/download/v2026.03/Allocate-2026.03.pkg"
-         class="bg-[#0071e3] hover:bg-[#0077ed] active:bg-[#006edb] text-white text-[13px] font-medium
-                px-5 py-[7px] rounded-full transition-colors duration-100 select-none">
-        Download
-      </a>
+      <div class="flex items-center gap-4">
+        <a href="https://github.com/awzheng/Allocate/releases/download/v2026.03/Allocate-2026.03.pkg"
+           class="bg-[#0071e3] hover:bg-[#0077ed] active:bg-[#006edb] text-white text-[13px] font-medium
+                  px-5 py-[7px] rounded-full transition-colors duration-100 select-none">
+          Download
+        </a>
+        <a href="https://github.com/awzheng/Allocate"
+           target="_blank" rel="noopener noreferrer"
+           class="bg-[#000000] hover:bg-[#000000] active:bg-[#000000] text-white text-[13px] font-medium
+                  px-5 py-[7px] rounded-full transition-colors duration-100 select-none">
+          GitHub
+        </a>
+      </div>
     </div>
   </nav>
 
@@ -31,7 +39,7 @@
 
     <!-- App Icon -->
     <img
-      src="assets/app-icon.png"
+      src="assets/app-icon-cropped.png"
       alt="Allocate app icon"
       class="w-24 h-24 rounded-[22px] shadow-[0_8px_30px_rgba(0,0,0,0.14)] mb-7 select-none pointer-events-none"
       draggable="false"
@@ -53,12 +61,14 @@
 
   <!-- Window Screenshot -->
   <section class="pb-24 flex justify-center">
-    <img
-      src="assets/allocate-window.png"
-      alt="Allocate app window"
-      class="w-full max-w-[560px] rounded-2xl shadow-[0_40px_100px_rgba(0,0,0,0.18)] select-none pointer-events-none"
-      draggable="false"
-    />
+    <div class="w-full max-w-[560px] rounded-xl overflow-hidden shadow-[0_40px_100px_rgba(0,0,0,0.18)] ring-[1.5px] ring-inset ring-[#f0f4f8]">
+      <img
+        src="assets/allocate-window-cropped.png"
+        alt="Allocate app window"
+        class="w-full block select-none pointer-events-none"
+        draggable="false"
+      />
+    </div>
   </section>
 
   <!-- Footer -->
