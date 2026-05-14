@@ -24,4 +24,4 @@
 
 <p align="center">&#169; Andrew Zheng 2026</p>
 
-<p align="center">MIT License — see [LICENSE](LICENSE) for full text.</p>
+<p align="center">MIT License — see <a href="LICENSE">LICENSE</a> for full text.</p>
