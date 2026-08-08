@@ -2,6 +2,8 @@
 
 <p align="center"><img src="allocate-site/assets/allocate-window.png" width="500" /></p>
 
+Allocate redirects intense background processes to your Silicon Mac's e-cores in real-time using XNU QoS based on user-set thresholds to cut background CPU consumption.
+
 ## Gallery
 <p align="center"><img src="allocate-site/assets/2026-03-24c.jpeg" /></p>
 
