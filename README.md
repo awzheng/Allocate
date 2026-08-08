@@ -8,7 +8,7 @@
 - Top-left: Rust daemon terminal UI
 - Top-right: Minecraft, running with shaders + Distant Horizons (256 chunk render distance)
 - Bottom-left: `dummy-hog` computing infinitely large prime numbers
-- Bottom-middle: macOS Activity Monitor
+- Bottom-middle: macOS Activity Monitor for proof-of-results
 - Bottom-right: Pre-release Allocate UI with process table, live CPU chart, and configurable thresholds 
 
 <table align="center" border="0">
