@@ -6,7 +6,7 @@
 <p align="center"><img src="allocate-site/assets/2026-03-24c.jpeg" /></p>
 
 - Top-left: Rust daemon terminal UI
-- Top-right: Minecraft, running with shaders + Distant Horizons
+- Top-right: Minecraft, running with shaders + Distant Horizons (256 chunk render distance)
 - Bottom-left: `dummy-hog` computing infinitely large prime numbers
 - Bottom-middle: macOS Activity Monitor
 - Bottom-right: Pre-release Allocate UI with process table, live CPU chart, and configurable thresholds 
