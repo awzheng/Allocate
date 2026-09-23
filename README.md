@@ -4,6 +4,16 @@
 
 Allocate redirects intense background processes to your Silicon Mac's e-cores in real-time using XNU QoS based on user-set thresholds to cut background CPU consumption.
 
+## Demo Video
+
+<p align="center">
+  <video src="allocate_demo_compressed.mov" width="650" controls>
+    Your browser does not support the video tag.
+  </video>
+</p>
+
+Minecraft is an example for an intense background process. See the FPS counter on the top left and how it increases/decreases based on P-core vs. E-core assignment.
+
 ## Gallery
 <p align="center"><img src="allocate-site/assets/2026-03-24c.jpeg" /></p>
 
