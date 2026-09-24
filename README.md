@@ -7,7 +7,7 @@ Allocate redirects intense background processes to your Silicon Mac's e-cores in
 ## Demo Video
 
 <p align="center">
-  <a href="https://youtu.be/zRra3QZDreI">
+  <a href="https://youtu.be/zRra3QZDreI" target="_blank" rel="noopener noreferrer">
     <img src="demo-thumbnail.png" width="650" />
   </a>
 </p>
