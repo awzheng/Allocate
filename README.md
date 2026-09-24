@@ -7,9 +7,9 @@ Allocate redirects intense background processes to your Silicon Mac's e-cores in
 ## Demo Video
 
 <p align="center">
-  <video src="allocate_demo_compressed.mov" width="650" controls>
-    Your browser does not support the video tag.
-  </video>
+  <a href="https://youtu.be/zRra3QZDreI">
+    <img src="demo-thumbnail.png" width="650" />
+  </a>
 </p>
 
 Minecraft is an example for an intense background process. See the FPS counter on the top left and how it increases/decreases based on P-core vs. E-core assignment.
